@@ -10,7 +10,7 @@ import asyncio
 import time
 import re
 from discord import app_commands
-from config import *
+TOKEN = os.getenv("TOKEN")
 # ==============================================================================
 # 1. CORE CONFIGURATION & INTENTS SECURITY
 # ==============================================================================
@@ -1048,6 +1048,16 @@ def keep_alive():
 # ==============================================================================
 
 if __name__ == "__main__":
+    files = [
+    "afk.json",
+    "edit_logs.json",
+    "snipe.json",
+    "warns.json"
+]
+
+for file in files:
+    if not os.path.exists(file):
+        with open(file, "w") as f:
+            f.write("{}")
     keep_alive()
-    print(TOKEN[:10])
     bot.run(TOKEN)

@@ -1,7 +1,8 @@
 import os
 import discord
+from discord import member
 from discord.ext import commands, tasks
-from flask import Flask
+from flask import Flask, ctx, ctx
 import threading
 import datetime
 import json
@@ -21,8 +22,6 @@ intents.presences = True
 
 # Prefix changed from "!" to "?" — all commands are now used like ?warn, ?mute, ?bump etc.
 bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
-
-WELCOME_CHANNEL_ID = 876543210987654321
 
 # Dictionary maps display labels to target role search strings
 COLOR_ROLES_1 = {
@@ -195,6 +194,16 @@ def get_flexible_channel(guild, keywords):
             return channel
     return None
 
+async def send_bot_log(guild, embed):
+
+    channel = get_flexible_channel(
+        guild,
+        ["bot-logs"]
+    )
+
+    if channel:
+        await channel.send(embed=embed)
+
 # ==============================================================================
 # 3. INTERACTIVE UI ELEMENTS (CASE INSENSITIVE SMART COLOR SEARCH)
 # ==============================================================================
@@ -275,45 +284,170 @@ async def on_ready():
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
-    channel = get_flexible_channel(guild, ["general", "general-chat", "chat"]) or bot.get_channel(WELCOME_CHANNEL_ID) or get_flexible_channel(guild, "welcome")
 
-    if channel:
-        total_members = len(guild.members)
-        if total_members % 10 == 1 and total_members % 100 != 11: suffix = "st"
-        elif total_members % 10 == 2 and total_members % 100 != 12: suffix = "nd"
-        elif total_members % 10 == 3 and total_members % 100 != 13: suffix = "rd"
-        else: suffix = "th"
+    general_channel = get_flexible_channel(
+        guild,
+        ["general", "general-chat"]
+    )
 
-        aquasmile_emoji = discord.utils.get(guild.emojis, name="Aquasmile")
-        emoji_str = str(aquasmile_emoji) if aquasmile_emoji else "😊"
+    welcome_channel = get_flexible_channel(
+        guild,
+        ["welcome"]
+    )
 
-        rules_channel = get_flexible_channel(guild, "rules")
-        rules_mention = rules_channel.mention if rules_channel else "#rules"
+    welcome_logs_channel = get_flexible_channel(
+        guild,
+        ["welcome-logs"]
+    )
 
-        greeter_role = discord.utils.get(guild.roles, name=GREETER_ROLE_NAME)
-        greeter_mention = greeter_role.mention if greeter_role else "@Greeter"
+    join_leave_channel = get_flexible_channel(
+        guild,
+        ["join-leave", "join-leave-logs"]
+    )
 
-        outer_content_text = f"Welcome to Kuch Nahi Family 🤗 {member.mention} {greeter_mention}"
+    total_members = len(guild.members)
 
-        clean_welcome_text = (
-            f"Drop a hello {emoji_str}\n"
-            f"Check out {rules_mention}\n"
-            f"Have fun!\n\n"
-            f"**You are our {total_members}{suffix} member!**"
-        )
+    if total_members % 10 == 1 and total_members % 100 != 11:
+        suffix = "st"
+    elif total_members % 10 == 2 and total_members % 100 != 12:
+        suffix = "nd"
+    elif total_members % 10 == 3 and total_members % 100 != 13:
+        suffix = "rd"
+    else:
+        suffix = "th"
 
-        embed = discord.Embed(description=clean_welcome_text, color=discord.Color.from_rgb(255, 182, 193))
-        embed.set_author(name=member.name, icon_url=member.display_avatar.url)
+    aquasmile_emoji = discord.utils.get(
+        guild.emojis,
+        name="Aquasmile"
+    )
 
+    emoji_str = str(aquasmile_emoji) if aquasmile_emoji else "😊"
+
+    rules_channel = get_flexible_channel(guild, "rules")
+    rules_mention = rules_channel.mention if rules_channel else "#rules"
+
+    greeter_role = discord.utils.get(
+        guild.roles,
+        name=GREETER_ROLE_NAME
+    )
+
+    greeter_mention = (
+        greeter_role.mention
+        if greeter_role
+        else "@Greeter"
+    )
+
+    outer_content_text = (
+        f"Welcome to Kuch Nahi Family 🤗 "
+        f"{member.mention} {greeter_mention}"
+    )
+
+    clean_welcome_text = (
+        f"Drop a hello {emoji_str}\n"
+        f"Check out {rules_mention}\n"
+        f"Have fun!\n\n"
+        f"**You are our {total_members}{suffix} member!**"
+    )
+
+    embed = discord.Embed(
+        description=clean_welcome_text,
+        color=discord.Color.from_rgb(255, 182, 193)
+    )
+
+    embed.set_author(
+        name=member.name,
+        icon_url=member.display_avatar.url
+    )
+
+    # General chat
+    if general_channel:
         if os.path.exists("welcome.webp"):
             file = discord.File(
-        "welcome.webp",
-        filename="welcome.webp"
-    )
-            embed.set_thumbnail(url="attachment://welcome.webp")
-            await channel.send(content=outer_content_text, file=file, embed=embed)
+                "welcome.webp",
+                filename="welcome.webp"
+            )
+
+            embed.set_thumbnail(
+                url="attachment://welcome.webp"
+            )
+
+            await general_channel.send(
+                content=outer_content_text,
+                file=file,
+                embed=embed
+            )
         else:
-            await channel.send(content=outer_content_text, embed=embed)
+            await general_channel.send(
+                content=outer_content_text,
+                embed=embed
+            )
+
+    # Welcome channel
+    if welcome_channel:
+        await welcome_channel.send(
+            f"🎉 {member.mention} has arrived!"
+        )
+
+    # Welcome logs
+    if welcome_logs_channel:
+        log_embed = discord.Embed(
+            title="✅ Member Joined",
+            color=discord.Color.green()
+        )
+
+        log_embed.add_field(
+            name="User",
+            value=f"{member} ({member.id})",
+            inline=False
+        )
+
+        await welcome_logs_channel.send(
+            embed=log_embed
+        )
+
+    # Join/leave logs
+    if join_leave_channel:
+        await join_leave_channel.send(
+            f"🟢 {member} joined the server."
+        )
+
+@bot.event
+async def on_member_remove(member):
+
+    channel = get_flexible_channel(
+        member.guild,
+        ["join-leave", "join-leave-logs"]
+    )
+
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title="❌ Member Left",
+        color=discord.Color.red()
+    )
+
+    embed.add_field(
+        name="User",
+        value=f"{member} ({member.id})",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Account created",
+        value=member.created_at.strftime(
+            "%d-%m-%Y %I:%M %p"
+        ),
+        inline=False
+    )
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    await channel.send(embed=embed)
+    
+
 
 @bot.event
 async def on_message(message):
@@ -381,6 +515,43 @@ async def on_message_delete(message):
     snipe_data,
     SNIPE_HISTORY_FILE
 )
+    snipe_logs_channel = get_flexible_channel(
+        message.guild,
+        ["snipe-logs"]
+    )
+
+    if snipe_logs_channel:
+
+        embed = discord.Embed(
+            title="🗑️ Message Deleted",
+            color=discord.Color.orange()
+        )
+
+        embed.add_field(
+            name="Author",
+            value=message.author.mention,
+            inline=False
+        )
+
+        embed.add_field(
+            name="Channel",
+            value=message.channel.mention,
+            inline=False
+        )
+
+        embed.add_field(
+            name="Content",
+            value=message.content or "No text content",
+            inline=False
+        )
+
+        embed.set_footer(
+            text=get_ist_time().strftime(
+                "%d-%m-%Y %I:%M:%S %p"
+            )
+        )
+
+        await snipe_logs_channel.send(embed=embed)
 
     # Restrict trail size up to 20 messages deep per channel
     if len(snipe_data[channel_id]) > MAX_SNIPE_DEPTH:
@@ -390,6 +561,7 @@ async def on_message_delete(message):
             snipe_data,
             SNIPE_HISTORY_FILE
         )
+    
 
 @bot.event
 async def on_message_edit(before, after):
@@ -538,7 +710,7 @@ async def avatar(ctx: commands.Context, member: discord.Member = None):
     )
 
     await ctx.send(embed=embed)
-
+    
 @bot.command(name="color-list", help="Show the custom colors identity preview sheet.")
 @has_full_access()
 async def color_list(ctx: commands.Context):
@@ -769,6 +941,30 @@ async def warn(ctx: commands.Context, member: discord.Member, *, reason: str):
     embed.add_field(name="Total Violations", value=str(len(warns_db[g_id][m_id])), inline=True)
     embed.add_field(name="Reason Specification", value=reason, inline=False)
     await ctx.send(embed=embed)
+    log_embed = discord.Embed(
+    title="⚠️ Warning Issued",
+    color=discord.Color.orange()
+)
+
+    log_embed.add_field(
+    name="Member",
+    value=member.mention,
+    inline=False
+)
+
+    log_embed.add_field(
+    name="Moderator",
+    value=ctx.author.mention,
+    inline=False
+)
+
+    log_embed.add_field(
+    name="Reason",
+    value=reason,
+    inline=False
+)
+
+    await send_bot_log(ctx.guild, log_embed)
 
 @bot.command(name="warns", help="View warning history. Usage: ?warns @member")
 @has_mod_access()
@@ -822,73 +1018,32 @@ async def mute(
 ):
 
     match = re.fullmatch(r"(\d+)([mhd])", duration.lower())
-
     if not match:
-        await ctx.send(
-            "**Invalid Time Format!**\n\n"
-            "**Examples:**\n"
-            "`?mute @member 10m`\n"
-            "`?mute @member 30m`\n"
-            "`?mute @member 1h`\n"
-            "`?mute @member 2h`\n"
-            "`?mute @member 1d`\n"
-            "`?mute @member 7d`\n"
-            "`?mute @member 1h Spamming`"
-        )
+        await ctx.send("Invalid format")
         return
-
-    amount = int(match.group(1))
-    unit = match.group(2)
-
-    if unit == "m":
-        delta = datetime.timedelta(minutes=amount)
-
-    elif unit == "h":
-        delta = datetime.timedelta(hours=amount)
-
+    amount=int(match.group(1))
+    unit=match.group(2)
+    if unit=="m":
+        delta=datetime.timedelta(minutes=amount)
+    elif unit=="h":
+        delta=datetime.timedelta(hours=amount)
     else:
-        delta = datetime.timedelta(days=amount)
-
+        delta=datetime.timedelta(days=amount)
     try:
-
-        await member.timeout(
-            delta,
-            reason=reason
-        )
-
-        embed = discord.Embed(
-            title="🔇 Member Muted",
-            color=discord.Color.red()
-        )
-
-        embed.add_field(
-            name="Member",
-            value=member.mention,
-            inline=True
-        )
-
-        embed.add_field(
-            name="Duration",
-            value=duration,
-            inline=True
-        )
-
-        embed.add_field(
-            name="Moderator",
-            value=ctx.author.mention,
-            inline=True
-        )
-
-        embed.add_field(
-            name="Reason",
-            value=reason,
-            inline=False
-        )
-
+        await member.timeout(delta, reason=reason)
+        embed=discord.Embed(title="🔇 Member Muted", color=discord.Color.red())
+        embed.add_field(name="Member", value=member.mention, inline=True)
+        embed.add_field(name="Duration", value=duration, inline=True)
+        embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
         await ctx.send(embed=embed)
-
+        log_embed=discord.Embed(title="🔇 Member Muted", color=discord.Color.red())
+        log_embed.add_field(name="Member", value=member.mention, inline=False)
+        log_embed.add_field(name="Moderator", value=ctx.author.mention, inline=False)
+        log_embed.add_field(name="Duration", value=duration, inline=False)
+        log_embed.add_field(name="Reason", value=reason, inline=False)
+        await send_bot_log(ctx.guild, log_embed)
     except Exception as e:
-
         await ctx.send(f"❌ {e}")
 
 @bot.command(name="unmute", help="Remove a member's timeout. Usage: ?unmute @member")
@@ -1046,18 +1201,19 @@ def keep_alive():
 # ==============================================================================
 # 14. BOOT ENGINE INSTANTIATOR
 # ==============================================================================
-
 if __name__ == "__main__":
-    files = [
-    "afk.json",
-    "edit_logs.json",
-    "snipe.json",
-    "warns.json"
-]
 
-for file in files:
-    if not os.path.exists(file):
-        with open(file, "w") as f:
-            f.write("{}")
+    files = [
+        "afk.json",
+        "edit_logs.json",
+        "snipe.json",
+        "warns.json"
+    ]
+
+    for file in files:
+        if not os.path.exists(file):
+            with open(file, "w") as f:
+                f.write("{}")
+
     keep_alive()
     bot.run(TOKEN)

@@ -1,8 +1,7 @@
 import os
 import discord
-from discord import member
 from discord.ext import commands, tasks
-from flask import Flask, ctx, ctx
+from flask import Flask
 import threading
 import datetime
 import json
@@ -452,35 +451,72 @@ async def on_member_remove(member):
 @bot.event
 async def on_message(message):
 
+    # Ignore messages sent by bots
+    if message.author.bot:
+        return
+
+    # Ignore DMs
+    if not message.guild:
+        return
+
     afk_db = load_json_data(AFK_FILE)
     author_id = str(message.author.id)
     guild_id = str(message.guild.id)
 
+    # ---------------------------------------------------------
+    # REMOVE AFK WHEN THE AFK USER SENDS A MESSAGE
+    # ---------------------------------------------------------
+
     if guild_id in afk_db and author_id in afk_db[guild_id]:
-        original_name = afk_db[guild_id][author_id].get("original_name", message.author.display_name)
+
+        original_name = afk_db[guild_id][author_id].get(
+            "original_name",
+            message.author.display_name
+        )
+
         afk_db[guild_id].pop(author_id)
         save_json_data(afk_db, AFK_FILE)
+
         try:
             await message.author.edit(nick=original_name)
         except discord.Forbidden:
             pass
-        await message.channel.send(f"wb {message.author.mention}, maine aapka AFK status hata diya hai! 👋", delete_after=5)
+
+        await message.channel.send(
+            f"wb {message.author.mention}, maine aapka AFK status hata diya hai! 👋",
+            delete_after=5
+        )
+
+    # ---------------------------------------------------------
+    # CHECK IF SOMEONE MENTIONED AN AFK USER
+    # ---------------------------------------------------------
 
     if message.mentions:
+
         for mentioned_user in message.mentions:
+
             m_id = str(mentioned_user.id)
+
             if guild_id in afk_db and m_id in afk_db[guild_id]:
+
                 reason = afk_db[guild_id][m_id]["reason"]
                 afk_time = afk_db[guild_id][m_id]["time"]
+
                 elapsed = int(time.time() - afk_time)
-                if elapsed < 60: duration_str = f"{elapsed}s ago"
-                elif elapsed < 3600: duration_str = f"{elapsed // 60}m ago"
-                else: duration_str = f"{elapsed // 3600}h ago"
+
+                if elapsed < 60:
+                    duration_str = f"{elapsed}s ago"
+                elif elapsed < 3600:
+                    duration_str = f"{elapsed // 60}m ago"
+                else:
+                    duration_str = f"{elapsed // 3600}h ago"
 
                 await message.channel.send(
-                    f"💤 {mentioned_user.name} abhi AFK hain: **{reason}** ({duration_str})",
+                    f"💤 {mentioned_user.name} abhi AFK hain: "
+                    f"**{reason}** ({duration_str})",
                     reference=message
                 )
+
     await bot.process_commands(message)
 
 @bot.event
@@ -491,7 +527,62 @@ async def on_message_delete(message):
     history_db = load_json_data(SNIPE_FILE)
     msg_id = str(message.id)
     was_edited = msg_id in history_db and history_db[msg_id].get("guild_id") == guild_id
+        # =========================================================
+    # MESSAGE LOGS - DELETED MESSAGE
+    # =========================================================
 
+    message_logs_channel = get_flexible_channel(
+        message.guild,
+        ["message-logs", "message logs"]
+    )
+
+    if message_logs_channel:
+
+        log_embed = discord.Embed(
+            title="🗑️ Message Deleted",
+            color=discord.Color.red()
+        )
+
+        log_embed.add_field(
+            name="👤 Author",
+            value=f"{message.author.mention} (`{message.author.id}`)",
+            inline=False
+        )
+
+        log_embed.add_field(
+            name="📍 Channel",
+            value=message.channel.mention,
+            inline=False
+        )
+
+        log_embed.add_field(
+            name="💬 Content",
+            value=message.content[:1024] if message.content else "No text content",
+            inline=False
+        )
+
+        if message.attachments:
+            attachments = "\n".join(
+                attachment.url for attachment in message.attachments
+            )
+
+            log_embed.add_field(
+                name="📎 Attachments",
+                value=attachments[:1024],
+                inline=False
+            )
+
+        log_embed.set_thumbnail(
+            url=message.author.display_avatar.url
+        )
+
+        log_embed.set_footer(
+            text=get_ist_time().strftime("%d-%m-%Y %I:%M:%S %p")
+        )
+
+        await message_logs_channel.send(
+            embed=log_embed
+        )
     edit_note = ""
     if was_edited:
         edit_note = f"\n*(⚠️ Note: Message was updated prior to deletion. State captured: \"{history_db[msg_id]['before']}\")*"
@@ -515,43 +606,6 @@ async def on_message_delete(message):
     snipe_data,
     SNIPE_HISTORY_FILE
 )
-    snipe_logs_channel = get_flexible_channel(
-        message.guild,
-        ["snipe-logs"]
-    )
-
-    if snipe_logs_channel:
-
-        embed = discord.Embed(
-            title="🗑️ Message Deleted",
-            color=discord.Color.orange()
-        )
-
-        embed.add_field(
-            name="Author",
-            value=message.author.mention,
-            inline=False
-        )
-
-        embed.add_field(
-            name="Channel",
-            value=message.channel.mention,
-            inline=False
-        )
-
-        embed.add_field(
-            name="Content",
-            value=message.content or "No text content",
-            inline=False
-        )
-
-        embed.set_footer(
-            text=get_ist_time().strftime(
-                "%d-%m-%Y %I:%M:%S %p"
-            )
-        )
-
-        await snipe_logs_channel.send(embed=embed)
 
     # Restrict trail size up to 20 messages deep per channel
     if len(snipe_data[channel_id]) > MAX_SNIPE_DEPTH:
@@ -579,6 +633,57 @@ async def on_message_edit(before, after):
     if len(history_db) > 100:
         history_db.pop(list(history_db.keys())[0])
     save_json_data(history_db, SNIPE_FILE)
+        # =========================================================
+    # MESSAGE LOGS - EDITED MESSAGE
+    # =========================================================
+
+    message_logs_channel = get_flexible_channel(
+        before.guild,
+        ["message-logs", "message logs"]
+    )
+
+    if message_logs_channel:
+
+        log_embed = discord.Embed(
+            title="✏️ Message Edited",
+            color=discord.Color.orange()
+        )
+
+        log_embed.add_field(
+            name="👤 Author",
+            value=f"{before.author.mention} (`{before.author.id}`)",
+            inline=False
+        )
+
+        log_embed.add_field(
+            name="📍 Channel",
+            value=before.channel.mention,
+            inline=False
+        )
+
+        log_embed.add_field(
+            name="📝 Before",
+            value=before.content[:1024] if before.content else "No text content",
+            inline=False
+        )
+
+        log_embed.add_field(
+            name="✏️ After",
+            value=after.content[:1024] if after.content else "No text content",
+            inline=False
+        )
+
+        log_embed.set_thumbnail(
+            url=before.author.display_avatar.url
+        )
+
+        log_embed.set_footer(
+            text=get_ist_time().strftime("%d-%m-%Y %I:%M:%S %p")
+        )
+
+        await message_logs_channel.send(
+            embed=log_embed
+        )
 
 @bot.event
 async def on_command_error(ctx, error):

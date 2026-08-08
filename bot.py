@@ -1,5 +1,7 @@
 import os
 import discord
+from dotenv import load_dotenv
+from supabase import create_client
 from discord.ext import commands, tasks
 from flask import Flask
 import threading
@@ -10,7 +12,17 @@ import asyncio
 import time
 import re
 from discord import app_commands
+load_dotenv()
+
 TOKEN = os.getenv("TOKEN")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
 # ==============================================================================
 # 1. CORE CONFIGURATION & INTENTS SECURITY
 # ==============================================================================
@@ -178,7 +190,38 @@ def save_json_data(data, filename):
             json.dump(data, f, indent=4, ensure_ascii=False)
     except Exception as e:
         print(f"Database write error: {e}")
+def get_afk_from_db(guild_id, user_id):
+    response = (
+        supabase
+        .table("afk_data")
+        .select("*")
+        .eq("guild_id", str(guild_id))
+        .eq("user_id", str(user_id))
+        .execute()
+    )
 
+    if response.data:
+        return response.data[0]
+
+    return None
+
+
+def set_afk_in_db(guild_id, user_id, reason, afk_time, original_name):
+    supabase.table("afk_data").upsert({
+        "guild_id": str(guild_id),
+        "user_id": str(user_id),
+        "reason": reason,
+        "afk_time": float(afk_time),
+        "original_name": original_name
+    }).execute()
+
+
+def remove_afk_from_db(guild_id, user_id):
+    supabase.table("afk_data").delete().eq(
+        "guild_id", str(guild_id)
+    ).eq(
+        "user_id", str(user_id)
+    ).execute()
 # Upgraded Deep Snipe Storage Structure
 snipe_data = load_json_data(
     SNIPE_HISTORY_FILE
@@ -269,6 +312,371 @@ class ColorView(discord.ui.View):
         self.add_item(ColorSelectMenu("Pick Color (Part 2: 21-32)...", COLOR_ROLES_2, "general:color_select_2"))
 
 # ==============================================================================
+# SELF ROLE SYSTEM
+# ==============================================================================
+
+SELF_ROLE_CHANNEL_KEYWORDS = [
+    "self-roles",
+    "self roles",
+    "selfroles"
+]
+
+GENDER_ROLES = {
+    "👨 Male": "Male",
+    "👩 Female": "Female"
+}
+
+AGE_ROLES = {
+    "🔹 13–17": "13-17",
+    "🔹 18–24": "18-24",
+    "🔹 25–30": "25-30",
+    "🔹 30+": "30+"
+}
+
+GAME_ROLES = {
+    "🎲 Cambio": "Cambio",
+    "🏦 Monopoly": "Monopoly",
+    "🎯 Valorant": "Valorant",
+    "✏️ Scribbl": "Scribbl",
+    "🎵 Music Guesser": "Music Guesser",
+    "🧱 Roblox": "Roblox",
+    "🕵️ CodeNames": "CodeNames",
+    "♟️ Chess": "Chess"
+}
+
+NSFW_ROLE = "Gooners"
+
+
+def find_role(guild, role_name):
+    return discord.utils.find(
+        lambda role: role.name.lower() == role_name.lower(),
+        guild.roles
+    )
+
+
+class SelfRoleSelect(discord.ui.Select):
+
+    def __init__(
+        self,
+        placeholder,
+        roles_dict,
+        custom_id,
+        exclusive=False
+    ):
+
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=role_name
+            )
+            for label, role_name in roles_dict.items()
+        ]
+
+        super().__init__(
+            placeholder=placeholder,
+            min_values=0,
+            max_values=1 if exclusive else len(options),
+            options=options,
+            custom_id=custom_id
+        )
+
+        self.roles_dict = roles_dict
+        self.exclusive = exclusive
+
+    async def callback(self, interaction: discord.Interaction):
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        member = interaction.user
+
+        selected_roles = set(self.values)
+
+        # ----------------------------------------------------------
+        # EXCLUSIVE ROLE GROUPS
+        # ----------------------------------------------------------
+
+        if self.exclusive:
+
+            selected_role_name = self.values[0] if self.values else None
+
+            for role_name in self.roles_dict.values():
+
+                role = find_role(guild, role_name)
+
+                if role and role in member.roles:
+
+                    if role_name != selected_role_name:
+
+                        try:
+                            await member.remove_roles(role)
+                        except discord.Forbidden:
+                            await interaction.followup.send(
+                                "❌ I cannot manage one of these roles. "
+                                "Please move Dhawal's role above the self-roles.",
+                                ephemeral=True
+                            )
+                            return
+
+            if selected_role_name:
+
+                target_role = find_role(
+                    guild,
+                    selected_role_name
+                )
+
+                if not target_role:
+
+                    await interaction.followup.send(
+                        f"❌ Role `{selected_role_name}` was not found.",
+                        ephemeral=True
+                    )
+                    return
+
+                if target_role not in member.roles:
+
+                    try:
+                        await member.add_roles(target_role)
+                    except discord.Forbidden:
+
+                        await interaction.followup.send(
+                            "❌ I cannot manage this role. "
+                            "Move Dhawal's role above the self-roles.",
+                            ephemeral=True
+                        )
+                        return
+
+                await interaction.followup.send(
+                    f"✅ Your role is now **{target_role.name}**.",
+                    ephemeral=True
+                )
+
+            return
+
+        # ----------------------------------------------------------
+        # MULTI-SELECT GAME ROLES
+        # ----------------------------------------------------------
+
+        added = []
+        removed = []
+
+        for role_name in self.roles_dict.values():
+
+            role = find_role(guild, role_name)
+
+            if not role:
+                continue
+
+            if role_name in selected_roles:
+
+                if role not in member.roles:
+
+                    try:
+                        await member.add_roles(role)
+                        added.append(role.name)
+                    except discord.Forbidden:
+                        pass
+
+            else:
+
+                if role in member.roles:
+
+                    try:
+                        await member.remove_roles(role)
+                        removed.append(role.name)
+                    except discord.Forbidden:
+                        pass
+
+        response = []
+
+        if added:
+            response.append(
+                "✅ Added: " +
+                ", ".join(f"**{role}**" for role in added)
+            )
+
+        if removed:
+            response.append(
+                "🗑️ Removed: " +
+                ", ".join(f"**{role}**" for role in removed)
+            )
+
+        if not response:
+            response.append(
+                "ℹ️ No changes were made."
+            )
+
+        await interaction.followup.send(
+            "\n".join(response),
+            ephemeral=True
+        )
+
+
+class NSFWRoleButton(discord.ui.Button):
+
+    def __init__(self):
+
+        super().__init__(
+            label="🔞 Get Gooners Role",
+            style=discord.ButtonStyle.danger,
+            custom_id="selfrole:nsfw"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        member = interaction.user
+
+        role = find_role(
+            guild,
+            NSFW_ROLE
+        )
+
+        if not role:
+
+            await interaction.followup.send(
+                "❌ The `Gooners` role was not found.",
+                ephemeral=True
+            )
+            return
+
+        try:
+
+            if role in member.roles:
+
+                await member.remove_roles(role)
+
+                await interaction.followup.send(
+                    "🔞 Gooners role removed.",
+                    ephemeral=True
+                )
+
+            else:
+
+                await member.add_roles(role)
+
+                await interaction.followup.send(
+                    "🔞 Gooners role added.",
+                    ephemeral=True
+                )
+
+        except discord.Forbidden:
+
+            await interaction.followup.send(
+                "❌ I cannot manage the Gooners role. "
+                "Move Dhawal's role above it.",
+                ephemeral=True
+            )
+
+
+class SelfRoleView(discord.ui.View):
+
+    def __init__(self):
+
+        super().__init__(
+            timeout=None
+        )
+
+        # Gender - ONE ONLY
+        self.add_item(
+            SelfRoleSelect(
+                "👤 Select your gender",
+                GENDER_ROLES,
+                "selfrole:gender",
+                exclusive=True
+            )
+        )
+
+        # Age - ONE ONLY
+        self.add_item(
+            SelfRoleSelect(
+                "🎂 Select your age group",
+                AGE_ROLES,
+                "selfrole:age",
+                exclusive=True
+            )
+        )
+
+        # Games - MULTIPLE
+        self.add_item(
+            SelfRoleSelect(
+                "🎮 Select your games",
+                GAME_ROLES,
+                "selfrole:games",
+                exclusive=False
+            )
+        )
+
+        # NSFW
+        self.add_item(
+            NSFWRoleButton()
+        )
+
+@bot.command(
+    name="self-roles",
+    aliases=["selfroles", "selfrole"],
+    help="Post the self-role selection panel."
+)
+@has_full_access()
+async def self_roles(ctx: commands.Context):
+
+    embed = discord.Embed(
+        title="🎭 Self Roles",
+        description=(
+            "**Choose your roles below!**\n\n"
+            "👤 **Gender** — Choose **one**\n"
+            "🎂 **Age** — Choose **one**\n"
+            "🎮 **Games** — Choose as many as you want\n\n"
+            "────────────────────────\n\n"
+            "🔞 **NSFW Access**\n"
+            "Want access to NSFW content? "
+            "Get the **Gooners** role below."
+        ),
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="👤 Gender",
+        value="Choose one option.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎂 Age Group",
+        value="Choose one age group.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎮 Games",
+        value=(
+            "Select every game you play.\n"
+            "You can choose multiple."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔞 NSFW",
+        value=(
+            "For NSFW content, click "
+            "**Get Gooners Role**."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="You can change your selections anytime."
+    )
+
+    await ctx.send(
+        embed=embed,
+        view=SelfRoleView()
+    )
+
+# ==============================================================================
 # 5. EVENT DECORATORS & INTERCEPTORS (WELCOME, AFK, BUMP DETECTION)
 # ==============================================================================
 @bot.event
@@ -277,6 +685,7 @@ async def on_ready():
     await bot.tree.sync()
     print("✅ Slash commands synced.")
     bot.add_view(ColorView())
+    bot.add_view(SelfRoleView())
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Abhi9av 👑"))
     print("Prefix commands ready. Using '?' as the command prefix.")
 
@@ -459,7 +868,6 @@ async def on_message(message):
     if not message.guild:
         return
 
-    afk_db = load_json_data(AFK_FILE)
     author_id = str(message.author.id)
     guild_id = str(message.guild.id)
 
@@ -467,15 +875,15 @@ async def on_message(message):
     # REMOVE AFK WHEN THE AFK USER SENDS A MESSAGE
     # ---------------------------------------------------------
 
-    if guild_id in afk_db and author_id in afk_db[guild_id]:
+    author_afk = get_afk_from_db(guild_id, author_id)
 
-        original_name = afk_db[guild_id][author_id].get(
+    if author_afk:
+        original_name = author_afk.get(
             "original_name",
             message.author.display_name
         )
 
-        afk_db[guild_id].pop(author_id)
-        save_json_data(afk_db, AFK_FILE)
+        remove_afk_from_db(guild_id, author_id)
 
         try:
             await message.author.edit(nick=original_name)
@@ -492,17 +900,15 @@ async def on_message(message):
     # ---------------------------------------------------------
 
     if message.mentions:
-
         for mentioned_user in message.mentions:
-
             m_id = str(mentioned_user.id)
+            mentioned_afk = get_afk_from_db(guild_id, m_id)
 
-            if guild_id in afk_db and m_id in afk_db[guild_id]:
+            if mentioned_afk:
+                reason = mentioned_afk.get("reason", "AFK")
+                afk_time = float(mentioned_afk.get("afk_time", time.time()))
 
-                reason = afk_db[guild_id][m_id]["reason"]
-                afk_time = afk_db[guild_id][m_id]["time"]
-
-                elapsed = int(time.time() - afk_time)
+                elapsed = max(0, int(time.time() - afk_time))
 
                 if elapsed < 60:
                     duration_str = f"{elapsed}s ago"
@@ -733,30 +1139,40 @@ async def on_command_error(ctx, error):
 
 @bot.command(name="afk", help="Set your profile status to AFK. Usage: ?afk <reason>")
 async def afk(ctx: commands.Context, *, reason: str = "Working / Afk"):
-    afk_db = load_json_data(AFK_FILE)
     user_id = str(ctx.author.id)
     guild_id = str(ctx.guild.id)
-    if guild_id not in afk_db: afk_db[guild_id] = {}
 
-    # Bug fix: block re-applying AFK if user is already AFK
-    if user_id in afk_db[guild_id]:
-        existing_reason = afk_db[guild_id][user_id]["reason"]
-        await ctx.send(f"❌ {ctx.author.mention}, aap already AFK hain: **{existing_reason}**. Kuch bhi message bhejo AFK hatane ke liye!")
+    # Block re-applying AFK if user is already AFK
+    existing_afk = get_afk_from_db(guild_id, user_id)
+
+    if existing_afk:
+        existing_reason = existing_afk.get("reason", "AFK")
+        await ctx.send(
+            f"❌ {ctx.author.mention}, aap already AFK hain: "
+            f"**{existing_reason}**. Kuch bhi message bhejo AFK hatane ke liye!"
+        )
         return
 
     current_display_name = ctx.author.display_name
-    afk_db[guild_id][user_id] = {
-        "reason": reason,
-        "time": time.time(),
-        "original_name": current_display_name
-    }
-    save_json_data(afk_db, AFK_FILE)
+    afk_time = time.time()
+
+    set_afk_in_db(
+        guild_id=guild_id,
+        user_id=user_id,
+        reason=reason,
+        afk_time=afk_time,
+        original_name=current_display_name
+    )
+
     try:
         new_nick = f"[AFK] {current_display_name}"[:32]
         await ctx.author.edit(nick=new_nick)
     except discord.Forbidden:
         pass
-    await ctx.send(f"💤 {ctx.author.mention}, aap ab AFK hain: **{reason}**")
+
+    await ctx.send(
+        f"💤 {ctx.author.mention}, aap ab AFK hain: **{reason}**"
+    )
 @bot.command(
     name="afkclear",
     aliases=["afk-clear"],
@@ -765,23 +1181,21 @@ async def afk(ctx: commands.Context, *, reason: str = "Working / Afk"):
 @has_full_access()
 async def afk_clear(ctx: commands.Context, member: discord.Member):
 
-    afk_db = load_json_data(AFK_FILE)
-
     guild_id = str(ctx.guild.id)
     user_id = str(member.id)
 
-    if guild_id not in afk_db or user_id not in afk_db[guild_id]:
+    afk_data = get_afk_from_db(guild_id, user_id)
+
+    if not afk_data:
         await ctx.send(f"✅ {member.mention} is not AFK.")
         return
 
-    original_name = afk_db[guild_id][user_id].get(
+    original_name = afk_data.get(
         "original_name",
         member.display_name
     )
 
-    afk_db[guild_id].pop(user_id)
-
-    save_json_data(afk_db, AFK_FILE)
+    remove_afk_from_db(guild_id, user_id)
 
     try:
         await member.edit(nick=original_name)
@@ -1309,7 +1723,6 @@ def keep_alive():
 if __name__ == "__main__":
 
     files = [
-        "afk.json",
         "edit_logs.json",
         "snipe.json",
         "warns.json"

@@ -66,6 +66,10 @@ ADMIN_ROLE_NAME = "Admins"
 OWNER_ROLE_NAME = "Owners"
 BOOSTER_ROLE_NAME = "Server Booster"
 BUMPERS_ROLE_NAME = "Bumpers"
+BUMP_FILE = "bump_data.json"
+
+DISBOARD_BOT_ID = 302050872383242240
+BUMP_COOLDOWN_SECONDS = 2 * 60 * 60  # 2 hours
 
 # ==============================================================================
 # 2. HELPER FUNCTIONS & PERMISSION CHECKS
@@ -235,6 +239,18 @@ def get_flexible_channel(guild, keywords):
         if any(kw in channel.name.lower() for kw in keywords):
             return channel
     return None
+
+def get_bump_channel(guild):
+    """Finds whichever text channel has 'bump' anywhere in its name."""
+    return get_flexible_channel(guild, "bump")
+
+def schedule_bump_reminder(guild: discord.Guild, channel: discord.TextChannel):
+    bump_db = load_json_data(BUMP_FILE)
+    bump_db[str(guild.id)] = {
+        "channel_id": channel.id,
+        "remind_at": time.time() + BUMP_COOLDOWN_SECONDS
+    }
+    save_json_data(bump_db, BUMP_FILE)
 
 async def send_bot_log(guild, embed):
 
@@ -687,6 +703,8 @@ async def on_ready():
     bot.add_view(ColorView())
     bot.add_view(SelfRoleView())
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Abhi9av 👑"))
+    if not bump_reminder_loop.is_running():
+        bump_reminder_loop.start()
     print("Prefix commands ready. Using '?' as the command prefix.")
 
 @bot.event
@@ -862,6 +880,13 @@ async def on_message(message):
 
     # Ignore messages sent by bots
     if message.author.bot:
+        # Detect Disboard's successful bump confirmation and auto-schedule the 2 hour reminder
+        if message.guild and message.author.id == DISBOARD_BOT_ID and message.embeds:
+            embed_desc = (message.embeds[0].description or "").lower()
+            if "bump done" in embed_desc or "check it out on disboard" in embed_desc:
+                bump_channel = get_bump_channel(message.guild) or message.channel
+                schedule_bump_reminder(message.guild, bump_channel)
+                await bump_channel.send("✅ Bump registered! I'll ping **Bumpers** in 2 hours for the next one. 🔔")
         return
 
     # Ignore DMs
@@ -1134,6 +1159,37 @@ async def on_command_error(ctx, error):
     await ctx.send(f"❌ Execution error: `{error}`")
 
 # ==============================================================================
+# 6. BUMP REMINDER BACKGROUND LOOP
+# ==============================================================================
+@tasks.loop(minutes=1)
+async def bump_reminder_loop():
+    bump_db = load_json_data(BUMP_FILE)
+    if not bump_db:
+        return
+    now = time.time()
+    changed = False
+    for guild_id, entry in list(bump_db.items()):
+        if entry.get("remind_at", float("inf")) <= now:
+            guild = bot.get_guild(int(guild_id))
+            if guild:
+                channel = guild.get_channel(entry.get("channel_id"))
+                bumpers_role = discord.utils.get(guild.roles, name=BUMPERS_ROLE_NAME)
+                if channel:
+                    mention = bumpers_role.mention if bumpers_role else "@Bumpers"
+                    try:
+                        await channel.send(f"⏰ {mention} It's time to bump the server again! Use `/bump` here to keep us on top of Disboard. 🚀")
+                    except discord.Forbidden:
+                        pass
+            bump_db.pop(guild_id)
+            changed = True
+    if changed:
+        save_json_data(bump_db, BUMP_FILE)
+
+@bump_reminder_loop.before_loop
+async def before_bump_loop():
+    await bot.wait_until_ready()
+
+# ==============================================================================
 # 7. GENERAL UTILITIES, UTILS, & EXCLUSIVE AVATAR SYSTEMS
 # ==============================================================================
 
@@ -1372,6 +1428,18 @@ async def editlogs(ctx: commands.Context, member: discord.Member):
     embed.add_field(name="⏩ Modified Target State", value=f"```\n{found_log['after']}\n```", inline=False)
     embed.set_footer(text=f"Timestamp: {found_log['timestamp']} (IST Matrix)")
     await ctx.send(embed=embed)
+
+# ==============================================================================
+# 9. SERVER BUMP SYSTEM (DISBOARD)
+# ==============================================================================
+@bot.command(name="bump", help="Bump reminder helper. Points to Disboard's /bump and starts the 2h reminder timer.")
+async def bump_cmd(ctx: commands.Context):
+    bump_channel = get_bump_channel(ctx.guild) or ctx.channel
+    schedule_bump_reminder(ctx.guild, bump_channel)
+    await ctx.send(
+        f"📢 To actually bump us on Disboard, run Disboard's own `/bump` slash command here in {bump_channel.mention}.\n"
+        f"⏰ I've started the 2 hour countdown — I'll ping **@{BUMPERS_ROLE_NAME}** here when it's time to bump again!"
+    )
 
 # ==============================================================================
 # 8. ROLE MANAGEMENT (STAFF ONLY)

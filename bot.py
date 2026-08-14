@@ -169,6 +169,64 @@ def has_junior_admin_access():
 
     return commands.check(predicate)
 
+
+class FlexibleMemberConverter(commands.Converter):
+    """Allows moderation commands to use mentions, exact names, or name initials."""
+    async def convert(self, ctx, argument):
+        argument = argument.strip()
+        try:
+            return await commands.MemberConverter().convert(ctx, argument)
+        except commands.MemberNotFound:
+            pass
+
+        query = argument.lstrip("@").strip().lower()
+        exact_matches = [
+            member for member in ctx.guild.members
+            if member.name.lower() == query or member.display_name.lower() == query
+        ]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+        if len(exact_matches) > 1:
+            raise commands.BadArgument(
+                f"Multiple members match `{argument}`. Please use a mention."
+            )
+
+        prefix_matches = [
+            member for member in ctx.guild.members
+            if member.name.lower().startswith(query)
+            or member.display_name.lower().startswith(query)
+        ]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+        if len(prefix_matches) > 1:
+            names = ", ".join(member.display_name for member in prefix_matches[:5])
+            raise commands.BadArgument(
+                f"Multiple members start with `{argument}`: {names}. Please use a mention."
+            )
+        raise commands.MemberNotFound(argument)
+
+
+MODERATION_COMMAND_NAMES = {
+    "role", "warn", "warns", "clear-warns", "mute", "unmute",
+    "kick", "ban", "unban", "purge"
+}
+
+
+async def send_mod_response(ctx, *args, **kwargs):
+    """Send a moderation response that disappears after 10 seconds."""
+    kwargs.setdefault("delete_after", 10)
+    return await ctx.send(*args, **kwargs)
+
+
+@bot.before_invoke
+async def delete_moderation_command_after_delay(ctx):
+    if ctx.command and ctx.command.name in MODERATION_COMMAND_NAMES:
+        try:
+            await ctx.message.delete(delay=10)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+
 SNIPE_FILE = "edit_logs.json"
 SNIPE_HISTORY_FILE = "snipe.json"
 WARN_FILE = "warns.json"
@@ -1119,6 +1177,12 @@ async def on_message_edit(before, after):
 @bot.event
 async def on_command_error(ctx, error):
 
+    if ctx.command and ctx.command.name in MODERATION_COMMAND_NAMES:
+        try:
+            await ctx.message.delete(delay=10)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
     if isinstance(error, commands.CheckFailure):
         return
 
@@ -1128,7 +1192,7 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
 
         if ctx.command.name == "mute":
-            await ctx.send(
+            await send_mod_response(ctx, 
                 "**Mute Usage:**\n\n"
                 "`?mute @member 10m`\n"
                 "`?mute @member 30m`\n"
@@ -1140,23 +1204,23 @@ async def on_command_error(ctx, error):
             )
             return
 
-        await ctx.send(
+        await send_mod_response(ctx, 
             f"❌ Missing argument: `{error.param.name}`.\nUse `?help {ctx.command}`"
         )
         return
 
     if isinstance(error, commands.MemberNotFound):
-        await ctx.send(
+        await send_mod_response(ctx, 
             "❌ Could not find that member. Try mentioning them directly."
         )
         return
 
     if isinstance(error, commands.BadArgument):
-        await ctx.send(f"❌ Bad argument: `{error}`")
+        await send_mod_response(ctx, f"❌ Bad argument: `{error}`")
         return
 
     print(f"Unhandled command error: {error}")
-    await ctx.send(f"❌ Execution error: `{error}`")
+    await send_mod_response(ctx, f"❌ Execution error: `{error}`")
 
 # ==============================================================================
 # 6. BUMP REMINDER BACKGROUND LOOP
@@ -1444,69 +1508,113 @@ async def bump_cmd(ctx: commands.Context):
 # ==============================================================================
 # 8. ROLE MANAGEMENT (STAFF ONLY)
 # ==============================================================================
-@bot.command(name="role", help='Give/remove a role. Usage: ?role @member +RoleName  OR  ?role @member -RoleName')
+@bot.command(name="role", help='Give/remove a role. Usage: ?role @member +RoleName OR ?role @member @member +RoleName OR ?role @everyone +RoleName')
 @has_mod_access()
-async def role_cmd(ctx: commands.Context, member: discord.Member, *, role_action: str):
-    role_action = role_action.strip()
-    if not role_action or role_action[0] not in ("+", "-"):
-        await ctx.send("❌ Format Error: Use `?role @member +RoleName` to add or `?role @member -RoleName` to remove.")
+async def role_cmd(ctx: commands.Context, *targets_and_action: str):
+    if len(targets_and_action) < 2:
+        await send_mod_response(ctx, "❌ Format Error: Use `?role @member +RoleName`, `?role @member @member +RoleName`, or `?role @everyone +RoleName`.")
         return
 
-    action = role_action[0]
-    role_name = role_action[1:].strip()
+    # Read the role action from the raw command so role names containing spaces work.
+    raw_content = ctx.message.content
+    command_prefix = ctx.prefix or "?"
+    command_text = raw_content[len(command_prefix):].strip()
+    command_name = ctx.invoked_with or "role"
+    if command_text.lower().startswith(command_name.lower()):
+        command_text = command_text[len(command_name):].strip()
+
+    action_match = re.search(r"([+-])(.+)$", command_text)
+    if not action_match:
+        await send_mod_response(ctx, "❌ Format Error: The last argument must be `+RoleName` or `-RoleName`.")
+        return
+
+    action_token = action_match.group(0).strip()
+    if not action_token or action_token[0] not in ("+", "-"):
+        await send_mod_response(ctx, "❌ Format Error: The last argument must be `+RoleName` or `-RoleName`.")
+        return
+
+    action = action_token[0]
+    role_name = action_token[1:].strip()
     if not role_name:
-        await ctx.send("❌ Format Error: You must specify a role name after `+` or `-`.")
+        await send_mod_response(ctx, "❌ Format Error: You must specify a role name after `+` or `-`.")
         return
 
-    target_role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), ctx.guild.roles)
+    target_role = discord.utils.find(
+        lambda r: r.name.lower() == role_name.lower(),
+        ctx.guild.roles
+    )
     if not target_role:
-        await ctx.send(f"❌ Role `{role_name}` not found on this server.")
+        await send_mod_response(ctx, f"❌ Role `{role_name}` not found on this server.")
         return
 
-# ----- Security Check -----
-
-# Bot role must be above the target role
     if target_role >= ctx.guild.me.top_role:
-        await ctx.send("❌ I can't manage that role because it is above my highest role.")
+        await send_mod_response(ctx, "❌ I can't manage that role because it is above my highest role.")
         return
 
-# User cannot manage roles equal to or above their own top role
     if target_role >= ctx.author.top_role:
-        await ctx.send("❌ You cannot assign or remove a role that is equal to or higher than your highest role.")
+        await send_mod_response(ctx, "❌ You cannot assign or remove a role that is equal to or higher than your highest role.")
         return
+
     protected_roles = {
-    OWNER_ROLE_NAME,
-    ADMIN_ROLE_NAME,
-    SUPPORT_ROLE_NAME,
-    MODERATOR_ROLE_NAME,
-    JUNIOR_ADMIN_ROLE_NAME
-}
-
+        OWNER_ROLE_NAME, ADMIN_ROLE_NAME, SUPPORT_ROLE_NAME,
+        MODERATOR_ROLE_NAME, JUNIOR_ADMIN_ROLE_NAME
+    }
     if target_role.name in protected_roles:
-        await ctx.send("❌ This protected staff role cannot be assigned or removed using this command.")
+        await send_mod_response(ctx, "❌ This protected staff role cannot be assigned or removed using this command.")
         return
-    try:
-        if action == "+":
-            if target_role in member.roles:
-                await ctx.send(f"⚠️ {member.mention} already has **{target_role.name}**.")
-                return
-            await member.add_roles(target_role)
-            await ctx.send(f"✅ Added **{target_role.name}** to {member.mention}.")
-        else:
-            if target_role not in member.roles:
-                await ctx.send(f"⚠️ {member.mention} doesn't have **{target_role.name}**.")
-                return
-            await member.remove_roles(target_role)
-            await ctx.send(f"🗑️ Removed **{target_role.name}** from {member.mention}.")
-    except discord.Forbidden:
-        await ctx.send("❌ Discord Hierarchy limits: Put Bot's role above the target role!")
 
-# ==============================================================================
+    target_tokens = list(targets_and_action[:-1])
+    if any(token.lower() == "@everyone" for token in target_tokens):
+        targets = list(ctx.guild.members)
+    else:
+        mentioned_ids = {member.id for member in ctx.message.mentions}
+        targets = [member for member in ctx.guild.members if member.id in mentioned_ids]
+        if not targets:
+            await send_mod_response(ctx, "❌ No valid members found. Mention one or more members, or use `@everyone`.")
+            return
+
+    unique_targets = []
+    seen_ids = set()
+    for member in targets:
+        if member.id not in seen_ids:
+            seen_ids.add(member.id)
+            unique_targets.append(member)
+
+    added = 0
+    removed = 0
+    skipped = 0
+
+    try:
+        for member in unique_targets:
+            if member == ctx.guild.owner or member.top_role >= ctx.author.top_role:
+                skipped += 1
+                continue
+            if action == "+":
+                if target_role in member.roles:
+                    skipped += 1
+                    continue
+                await member.add_roles(target_role)
+                added += 1
+            else:
+                if target_role not in member.roles:
+                    skipped += 1
+                    continue
+                await member.remove_roles(target_role)
+                removed += 1
+    except discord.Forbidden:
+        await send_mod_response(ctx, "❌ Discord hierarchy/permission limit reached while processing the requested members.")
+        return
+
+    changed = added if action == "+" else removed
+    action_word = "Added" if action == "+" else "Removed"
+    await send_mod_response(ctx, f"✅ **{action_word} `{target_role.name}`** for `{changed}` member(s). Skipped `{skipped}` member(s).")
+
+
 # 10. STAFF ONLY ENFORCEMENT & MODERATION MODULES
 # ==============================================================================
 @bot.command(name="warn", help="Issue a warning. Usage: ?warn @member <reason>")
 @has_mod_access()
-async def warn(ctx: commands.Context, member: discord.Member, *, reason: str):
+async def warn(ctx: commands.Context, member: FlexibleMemberConverter, *, reason: str):
     warns_db = load_json_data(WARN_FILE)
     m_id = str(member.id)
     g_id = str(ctx.guild.id)
@@ -1527,7 +1635,7 @@ async def warn(ctx: commands.Context, member: discord.Member, *, reason: str):
     embed.add_field(name="User Info", value=member.mention, inline=True)
     embed.add_field(name="Total Violations", value=str(len(warns_db[g_id][m_id])), inline=True)
     embed.add_field(name="Reason Specification", value=reason, inline=False)
-    await ctx.send(embed=embed)
+    await send_mod_response(ctx, embed=embed)
     log_embed = discord.Embed(
     title="⚠️ Warning Issued",
     color=discord.Color.orange()
@@ -1555,13 +1663,13 @@ async def warn(ctx: commands.Context, member: discord.Member, *, reason: str):
 
 @bot.command(name="warns", help="View warning history. Usage: ?warns @member")
 @has_mod_access()
-async def views_warns(ctx: commands.Context, member: discord.Member):
+async def views_warns(ctx: commands.Context, member: FlexibleMemberConverter):
     warns_db = load_json_data(WARN_FILE)
     m_id = str(member.id)
     g_id = str(ctx.guild.id)
 
     if g_id not in warns_db or m_id not in warns_db[g_id] or not warns_db[g_id][m_id]:
-        await ctx.send(f"✅ Clean Slate: {member.name} contains zero moderation flags.")
+        await send_mod_response(ctx, f"✅ Clean Slate: {member.name} contains zero moderation flags.")
         return
 
     embed = discord.Embed(title=f"📋 Enforcement Violation Log: {member.name}", color=discord.Color.yellow())
@@ -1571,11 +1679,11 @@ async def views_warns(ctx: commands.Context, member: discord.Member):
             value=f"**Reason:** {item['reason']}\n**Issued By:** {item['moderator']}",
             inline=False
         )
-    await ctx.send(embed=embed)
+    await send_mod_response(ctx, embed=embed)
 
 @bot.command(name="clear-warns", help="Purge a member's warnings. Usage: ?clear-warns @member")
 @has_full_access()
-async def clear_warns(ctx: commands.Context, member: discord.Member):
+async def clear_warns(ctx: commands.Context, member: FlexibleMemberConverter):
     warns_db = load_json_data(WARN_FILE)
     m_id = str(member.id)
     g_id = str(ctx.guild.id)
@@ -1583,7 +1691,7 @@ async def clear_warns(ctx: commands.Context, member: discord.Member):
     if g_id in warns_db and m_id in warns_db[g_id]:
         warns_db[g_id].pop(m_id)
         save_json_data(warns_db, WARN_FILE)
-    await ctx.send(f"🗑️ System cleanup: Warnings ledger cleared for {member.mention}.")
+    await send_mod_response(ctx, f"🗑️ System cleanup: Warnings ledger cleared for {member.mention}.")
 
 @bot.command(
     name="mute",
@@ -1598,7 +1706,7 @@ Usage:
 @has_mod_access()
 async def mute(
     ctx: commands.Context,
-    member: discord.Member,
+    member: FlexibleMemberConverter,
     duration: str,
     *,
     reason: str = "No reason provided."
@@ -1606,7 +1714,7 @@ async def mute(
 
     match = re.fullmatch(r"(\d+)([mhd])", duration.lower())
     if not match:
-        await ctx.send("Invalid format")
+        await send_mod_response(ctx, "Invalid format")
         return
     amount=int(match.group(1))
     unit=match.group(2)
@@ -1623,7 +1731,7 @@ async def mute(
         embed.add_field(name="Duration", value=duration, inline=True)
         embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
         embed.add_field(name="Reason", value=reason, inline=False)
-        await ctx.send(embed=embed)
+        await send_mod_response(ctx, embed=embed)
         log_embed=discord.Embed(title="🔇 Member Muted", color=discord.Color.red())
         log_embed.add_field(name="Member", value=member.mention, inline=False)
         log_embed.add_field(name="Moderator", value=ctx.author.mention, inline=False)
@@ -1631,34 +1739,34 @@ async def mute(
         log_embed.add_field(name="Reason", value=reason, inline=False)
         await send_bot_log(ctx.guild, log_embed)
     except Exception as e:
-        await ctx.send(f"❌ {e}")
+        await send_mod_response(ctx, f"❌ {e}")
 
 @bot.command(name="unmute", help="Remove a member's timeout. Usage: ?unmute @member")
 @has_mod_access()
-async def unmute(ctx: commands.Context, member: discord.Member):
+async def unmute(ctx: commands.Context, member: FlexibleMemberConverter):
     try:
         await member.timeout(None)
-        await ctx.send(f"🔊 Communication routing restored for profile user {member.mention}.")
+        await send_mod_response(ctx, f"🔊 Communication routing restored for profile user {member.mention}.")
     except Exception as e:
-        await ctx.send(f"❌ Execution failure: `{str(e)}`")
+        await send_mod_response(ctx, f"❌ Execution failure: `{str(e)}`")
 
 @bot.command(name="kick", help="Kick a member. Usage: ?kick @member <reason>")
 @has_junior_admin_access()
-async def kick(ctx: commands.Context, member: discord.Member, *, reason: str = "Unspecified"):
+async def kick(ctx: commands.Context, member: FlexibleMemberConverter, *, reason: str = "Unspecified"):
     try:
         await member.kick(reason=reason)
-        await ctx.send(f"👢 Kicked {member.name} successfully. Reason code: `{reason}`")
+        await send_mod_response(ctx, f"👢 Kicked {member.name} successfully. Reason code: `{reason}`")
     except Exception as e:
-        await ctx.send(f"❌ Command denied execution path: `{str(e)}`")
+        await send_mod_response(ctx, f"❌ Command denied execution path: `{str(e)}`")
 
 @bot.command(name="ban", help="Ban a member. Usage: ?ban @member <reason>")
 @has_junior_admin_access()
-async def ban(ctx: commands.Context, member: discord.Member, *, reason: str = "Unspecified"):
+async def ban(ctx: commands.Context, member: FlexibleMemberConverter, *, reason: str = "Unspecified"):
     try:
         await member.ban(reason=reason)
-        await ctx.send(f"🔨 Banned user identity hash {member.name} cleanly. Reason: `{reason}`")
+        await send_mod_response(ctx, f"🔨 Banned user identity hash {member.name} cleanly. Reason: `{reason}`")
     except Exception as e:
-        await ctx.send(f"❌ Execution pipeline blocked: `{str(e)}`")
+        await send_mod_response(ctx, f"❌ Execution pipeline blocked: `{str(e)}`")
 
 @bot.command(
     name="unban",
@@ -1690,28 +1798,69 @@ async def unban(ctx: commands.Context, user_id: int):
             inline=False
         )
 
-        await ctx.send(embed=embed)
+        await send_mod_response(ctx, embed=embed)
 
     except discord.NotFound:
 
-        await ctx.send("❌ No banned user found with that ID.")
+        await send_mod_response(ctx, "❌ No banned user found with that ID.")
 
     except discord.Forbidden:
 
-        await ctx.send("❌ I don't have permission to unban users.")
+        await send_mod_response(ctx, "❌ I don't have permission to unban users.")
 
     except Exception as e:
 
-        await ctx.send(f"❌ {e}")
+        await send_mod_response(ctx, f"❌ {e}")
 
-@bot.command(name="purge", help="Bulk delete messages. Usage: ?purge <count>")
+@bot.command(name="purge", help="Bulk delete messages. Usage: ?purge <count> OR ?purge @member <count>")
 @has_full_access()
-async def purge(ctx: commands.Context, count: int):
-    if count < 1:
-        await ctx.send("❌ Parameter constraint failed. Count value must be >= 1.")
+async def purge(ctx: commands.Context, *args: str):
+    if len(args) == 1:
+        try:
+            count = int(args[0])
+        except ValueError:
+            await send_mod_response(ctx, "❌ Usage: `?purge <count>` or `?purge @member <count>`.")
+            return
+        if count < 1:
+            await send_mod_response(ctx, "❌ Parameter constraint failed. Count value must be >= 1.")
+            return
+        deleted = await ctx.channel.purge(limit=count + 1)
+        await send_mod_response(ctx, f"🗑️ Bulk cleanup sweep over. Extinguished `{max(0, len(deleted) - 1)}` old trace packages.")
         return
-    deleted = await ctx.channel.purge(limit=count + 1)  # +1 to also remove the ?purge command message
-    await ctx.send(f"🗑️ Bulk cleanup sweep over. Extinguished `{len(deleted) - 1}` old trace packages.", delete_after=5)
+
+    if len(args) == 2:
+        try:
+            count = int(args[1])
+        except ValueError:
+            await send_mod_response(ctx, "❌ Usage: `?purge @member <count>`.")
+            return
+        if count < 1:
+            await send_mod_response(ctx, "❌ Parameter constraint failed. Count value must be >= 1.")
+            return
+
+        try:
+            target = await FlexibleMemberConverter().convert(ctx, args[0])
+        except commands.MemberNotFound:
+            await send_mod_response(ctx, f"❌ Could not find member `{args[0]}`.")
+            return
+        except commands.BadArgument as e:
+            await send_mod_response(ctx, f"❌ {e}")
+            return
+
+        matched_messages = []
+        async for message in ctx.channel.history(limit=min(1000, max(100, count * 20))):
+            if message.author.id == target.id:
+                matched_messages.append(message)
+                if len(matched_messages) >= count:
+                    break
+
+        if matched_messages:
+            await ctx.channel.delete_messages(matched_messages)
+
+        await send_mod_response(ctx, f"🗑️ Purged `{len(matched_messages)}` recent message(s) from **{target.display_name}**.")
+        return
+
+    await send_mod_response(ctx, "❌ Usage: `?purge <count>` or `?purge @member <count>`.")
 
 # ==============================================================================
 # 11. INFORMATIONAL LAYERS, METRICS & SERVER STATISTICS

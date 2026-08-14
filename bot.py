@@ -393,27 +393,69 @@ async def upload_deleted_media(message, guild_id):
     # as embeds rather than Discord attachments.
     embed_urls = []
     for embed in message.embeds:
-        if getattr(embed.image, "url", None):
-            embed_urls.append(embed.image.url)
-        elif getattr(embed.thumbnail, "url", None):
-            embed_urls.append(embed.thumbnail.url)
+        for candidate in (
+            getattr(getattr(embed, "image", None), "url", None),
+            getattr(getattr(embed, "thumbnail", None), "url", None),
+            getattr(getattr(embed, "video", None), "url", None),
+        ):
+            if candidate:
+                embed_urls.append(candidate)
+
+    # Also try direct media URLs if Discord did not create an embed object.
+    for url in re.findall(r"https?://\S+", message.content or ""):
+        embed_urls.append(url.rstrip(")>]}"))
 
     if embed_urls:
         async with aiohttp.ClientSession() as session:
             for index, url in enumerate(dict.fromkeys(embed_urls), start=1):
                 try:
-                    async with session.get(url, timeout=15) as response:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                        allow_redirects=True,
+                        headers={"User-Agent": "Mozilla/5.0"}
+                    ) as response:
                         if response.status != 200:
+                            print(f"Supabase embedded media download skipped ({response.status}): {url}")
                             continue
+
                         data = await response.read()
-                        content_type = response.headers.get("Content-Type", "application/octet-stream").split(";")[0]
+                        content_type = response.headers.get(
+                            "Content-Type", "application/octet-stream"
+                        ).split(";")[0].lower()
+
+                        # Some CDN responses omit a useful Content-Type.
+                        if content_type == "application/octet-stream":
+                            lower_url = url.lower().split("?")[0]
+                            if lower_url.endswith(".gif"):
+                                content_type = "image/gif"
+                            elif lower_url.endswith(".png"):
+                                content_type = "image/png"
+                            elif lower_url.endswith((".jpg", ".jpeg")):
+                                content_type = "image/jpeg"
+                            elif lower_url.endswith(".webp"):
+                                content_type = "image/webp"
+                            elif lower_url.endswith(".mp4"):
+                                content_type = "video/mp4"
+                            elif lower_url.endswith(".webm"):
+                                content_type = "video/webm"
+
                         extension = {
                             "image/gif": ".gif",
                             "image/png": ".png",
                             "image/jpeg": ".jpg",
-                            "image/webp": ".webp"
+                            "image/webp": ".webp",
+                            "video/mp4": ".mp4",
+                            "video/webm": ".webm",
+                            "audio/mpeg": ".mp3",
+                            "audio/ogg": ".ogg",
                         }.get(content_type, "")
-                        await upload_bytes(f"embedded_media_{index}{extension}", data, content_type)
+
+                        await upload_bytes(
+                            f"embedded_media_{index}{extension}",
+                            data,
+                            content_type
+                        )
                 except Exception as e:
                     print(f"Supabase embedded media upload error: {e}")
 
@@ -1164,7 +1206,7 @@ async def on_message_delete(message):
     # =========================================================
     # SAVE MEDIA BEFORE LOGGING THE DELETED MESSAGE
     # =========================================================
-    saved_media = await upload_deleted_media(message, guild_id) if message.attachments else []
+    saved_media = await upload_deleted_media(message, guild_id) if (message.attachments or message.embeds or re.search(r"https?://\S+", message.content or "")) else []
 
     # =========================================================
     # MESSAGE LOGS - DELETED MESSAGE

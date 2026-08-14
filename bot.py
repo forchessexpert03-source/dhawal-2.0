@@ -11,6 +11,7 @@ import pytz
 import asyncio
 import time
 import re
+import aiohttp
 from discord import app_commands
 load_dotenv()
 
@@ -284,11 +285,148 @@ def remove_afk_from_db(guild_id, user_id):
     ).eq(
         "user_id", str(user_id)
     ).execute()
+
+def save_snipe_to_supabase(payload, guild_id, channel_id, message_id):
+    """Persist one deleted-message record in Supabase."""
+    try:
+        supabase.table(SNIPE_SUPABASE_TABLE).upsert({
+            "message_id": str(message_id),
+            "guild_id": str(guild_id),
+            "channel_id": str(channel_id),
+            "author": payload.get("author", ""),
+            "author_id": str(payload.get("author_id", "")),
+            "avatar": payload.get("avatar", ""),
+            "content": payload.get("content", ""),
+            "timestamp": payload.get("timestamp", ""),
+            "extra_info": payload.get("extra_info", ""),
+            "attachments": payload.get("attachments", [])
+        }, on_conflict="message_id").execute()
+    except Exception as e:
+        print(f"Supabase snipe save error: {e}")
+
+def save_edit_to_supabase(message_id, data):
+    """Persist one edit-history record in Supabase."""
+    try:
+        supabase.table(EDIT_SUPABASE_TABLE).upsert({
+            "message_id": str(message_id),
+            **data
+        }, on_conflict="message_id").execute()
+    except Exception as e:
+        print(f"Supabase edit history save error: {e}")
+
+def load_snipe_from_supabase():
+    """Load deleted-message history into the in-memory cache after restart."""
+    global snipe_data
+    try:
+        response = (
+            supabase.table(SNIPE_SUPABASE_TABLE)
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(5000)
+            .execute()
+        )
+        rows = response.data or []
+        if not rows:
+            # Keep the existing local cache and migrate it into Supabase.
+            for channel_id, entries in snipe_data.items():
+                for entry in entries[:MAX_SNIPE_DEPTH]:
+                    save_snipe_to_supabase(
+                        entry,
+                        entry.get("guild_id", ""),
+                        channel_id,
+                        entry.get("message_id", f"local-{channel_id}-{time.time_ns()}")
+                    )
+            print("ℹ️ Supabase snipe table is empty; keeping the existing local snipe cache.")
+            return
+
+        loaded = {}
+        for row in rows:
+            channel_id = str(row.get("channel_id"))
+            payload = {
+                "content": row.get("content") or "[Empty Layer or File Stream Embedded]",
+                "author": row.get("author") or "Unknown",
+                "author_id": str(row.get("author_id") or ""),
+                "avatar": row.get("avatar") or "",
+                "timestamp": row.get("timestamp") or "",
+                "extra_info": row.get("extra_info") or "",
+                "attachments": row.get("attachments") or []
+            }
+            loaded.setdefault(channel_id, []).append(payload)
+        for channel_id in loaded:
+            loaded[channel_id] = loaded[channel_id][:MAX_SNIPE_DEPTH]
+        snipe_data = loaded
+        print(f"✅ Loaded deleted-message history from Supabase: {sum(len(v) for v in snipe_data.values())} records")
+    except Exception as e:
+        print(f"⚠️ Supabase snipe load failed; using local cache: {e}")
+
+async def upload_deleted_media(message, guild_id):
+    """Download deleted attachments/embedded media and persist them in Supabase Storage."""
+    saved = []
+
+    async def upload_bytes(name, data, content_type):
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name or "media")
+        path = f"{guild_id}/{message.channel.id}/{message.id}/{safe_name}"
+        supabase.storage.from_(MEDIA_BUCKET).upload(
+            path,
+            data,
+            {"content-type": content_type or "application/octet-stream", "upsert": "true"}
+        )
+        saved.append({
+            "name": name or "media",
+            "path": path,
+            "content_type": content_type or "application/octet-stream",
+            "size": len(data)
+        })
+
+    for attachment in message.attachments:
+        try:
+            data = await attachment.read()
+            await upload_bytes(
+                attachment.filename,
+                data,
+                attachment.content_type or "application/octet-stream"
+            )
+        except Exception as e:
+            print(f"Supabase media upload error ({attachment.filename}): {e}")
+
+    # Tenor/Giphy-style GIFs and other embedded media are often represented
+    # as embeds rather than Discord attachments.
+    embed_urls = []
+    for embed in message.embeds:
+        if getattr(embed.image, "url", None):
+            embed_urls.append(embed.image.url)
+        elif getattr(embed.thumbnail, "url", None):
+            embed_urls.append(embed.thumbnail.url)
+
+    if embed_urls:
+        async with aiohttp.ClientSession() as session:
+            for index, url in enumerate(dict.fromkeys(embed_urls), start=1):
+                try:
+                    async with session.get(url, timeout=15) as response:
+                        if response.status != 200:
+                            continue
+                        data = await response.read()
+                        content_type = response.headers.get("Content-Type", "application/octet-stream").split(";")[0]
+                        extension = {
+                            "image/gif": ".gif",
+                            "image/png": ".png",
+                            "image/jpeg": ".jpg",
+                            "image/webp": ".webp"
+                        }.get(content_type, "")
+                        await upload_bytes(f"embedded_media_{index}{extension}", data, content_type)
+                except Exception as e:
+                    print(f"Supabase embedded media upload error: {e}")
+
+    return saved
 # Upgraded Deep Snipe Storage Structure
 snipe_data = load_json_data(
     SNIPE_HISTORY_FILE
 )# Dynamic multi-level tracking channel_id -> list of deleted msgs
-MAX_SNIPE_DEPTH = 100  # Store history trail up to 100 deleted messages deep per channel
+MAX_SNIPE_DEPTH = 250  # Store history trail up to 250 deleted messages deep per channel
+SNIPE_SUPABASE_TABLE = "snipe_logs"
+EDIT_SUPABASE_TABLE = "edit_history"
+MEDIA_BUCKET = "deleted-media"
+snipe_supabase_loaded = False
 
 def get_flexible_channel(guild, keywords):
     if isinstance(keywords, str):
@@ -763,6 +901,10 @@ async def on_ready():
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Abhi9av 👑"))
     if not bump_reminder_loop.is_running():
         bump_reminder_loop.start()
+    global snipe_supabase_loaded
+    if not snipe_supabase_loaded:
+        load_snipe_from_supabase()
+        snipe_supabase_loaded = True
     print("Prefix commands ready. Using '?' as the command prefix.")
 
 @bot.event
@@ -1010,71 +1152,90 @@ async def on_message(message):
 
 @bot.event
 async def on_message_delete(message):
-    if message.author.bot or not message.guild: return
+    if message.author.bot or not message.guild:
+        return
+
     channel_id = str(message.channel.id)
     guild_id = str(message.guild.id)
     history_db = load_json_data(SNIPE_FILE)
     msg_id = str(message.id)
     was_edited = msg_id in history_db and history_db[msg_id].get("guild_id") == guild_id
-        # =========================================================
+
+    # =========================================================
+    # SAVE MEDIA BEFORE LOGGING THE DELETED MESSAGE
+    # =========================================================
+    saved_media = await upload_deleted_media(message, guild_id) if message.attachments else []
+
+    # =========================================================
     # MESSAGE LOGS - DELETED MESSAGE
     # =========================================================
-
     message_logs_channel = get_flexible_channel(
         message.guild,
         ["message-logs", "message logs"]
     )
 
     if message_logs_channel:
-
         log_embed = discord.Embed(
             title="🗑️ Message Deleted",
             color=discord.Color.red()
         )
-
         log_embed.add_field(
             name="👤 Author",
             value=f"{message.author.mention} (`{message.author.id}`)",
             inline=False
         )
-
         log_embed.add_field(
             name="📍 Channel",
             value=message.channel.mention,
             inline=False
         )
-
         log_embed.add_field(
             name="💬 Content",
             value=message.content[:1024] if message.content else "No text content",
             inline=False
         )
 
-        if message.attachments:
-            attachments = "\n".join(
-                attachment.url for attachment in message.attachments
-            )
+        if saved_media:
+            media_lines = []
+            first_image_url = None
+            for media in saved_media:
+                try:
+                    signed = supabase.storage.from_(MEDIA_BUCKET).create_signed_url(media["path"], 86400)
+                    signed_url = signed.get("signedURL") or signed.get("signed_url") or ""
+                    if signed_url:
+                        media_lines.append(f"[{media['name']}]({signed_url})")
+                        if first_image_url is None and str(media.get("content_type", "")).startswith("image/"):
+                            first_image_url = signed_url
+                except Exception:
+                    pass
 
+            if media_lines:
+                log_embed.add_field(
+                    name="📎 Saved Media",
+                    value="\n".join(media_lines)[:1024],
+                    inline=False
+                )
+            if first_image_url:
+                log_embed.set_image(url=first_image_url)
+
+        elif message.attachments:
+            attachments = "\n".join(attachment.url for attachment in message.attachments)
             log_embed.add_field(
                 name="📎 Attachments",
                 value=attachments[:1024],
                 inline=False
             )
 
-        log_embed.set_thumbnail(
-            url=message.author.display_avatar.url
-        )
+        log_embed.set_thumbnail(url=message.author.display_avatar.url)
+        log_embed.set_footer(text=get_ist_time().strftime("%d-%m-%Y %I:%M:%S %p"))
+        await message_logs_channel.send(embed=log_embed)
 
-        log_embed.set_footer(
-            text=get_ist_time().strftime("%d-%m-%Y %I:%M:%S %p")
-        )
-
-        await message_logs_channel.send(
-            embed=log_embed
-        )
     edit_note = ""
     if was_edited:
-        edit_note = f"\n*(⚠️ Note: Message was updated prior to deletion. State captured: \"{history_db[msg_id]['before']}\")*"
+        edit_note = (
+            f'\n*(⚠️ Note: Message was updated prior to deletion. '
+            f'State captured: "{history_db[msg_id]["before"]}")*'
+        )
 
     if channel_id not in snipe_data:
         snipe_data[channel_id] = []
@@ -1085,26 +1246,20 @@ async def on_message_delete(message):
         "author_id": str(message.author.id),
         "avatar": message.author.display_avatar.url,
         "timestamp": get_ist_time().strftime("%I:%M:%S %p"),
-        "extra_info": edit_note
+        "extra_info": edit_note,
+        "attachments": saved_media,
+        "message_id": msg_id,
+        "guild_id": guild_id
     }
 
-    # Insert at index 0 so position 1 is always the latest deleted message
     snipe_data[channel_id].insert(0, payload)
 
-    save_json_data(
-    snipe_data,
-    SNIPE_HISTORY_FILE
-)
-
-    # Restrict trail size up to 20 messages deep per channel
     if len(snipe_data[channel_id]) > MAX_SNIPE_DEPTH:
-        snipe_data[channel_id].pop()
+        snipe_data[channel_id] = snipe_data[channel_id][:MAX_SNIPE_DEPTH]
 
-        save_json_data(
-            snipe_data,
-            SNIPE_HISTORY_FILE
-        )
-    
+    save_json_data(snipe_data, SNIPE_HISTORY_FILE)
+    save_snipe_to_supabase(payload, guild_id, channel_id, msg_id)
+
 
 @bot.event
 async def on_message_edit(before, after):
@@ -1119,9 +1274,10 @@ async def on_message_edit(before, after):
         "after": after.content,
         "timestamp": get_ist_time().strftime("%Y-%m-%d %I:%M %p")
     }
-    if len(history_db) > 100:
+    if len(history_db) > 250:
         history_db.pop(list(history_db.keys())[0])
     save_json_data(history_db, SNIPE_FILE)
+    save_edit_to_supabase(str(before.id), history_db[str(before.id)])
         # =========================================================
     # MESSAGE LOGS - EDITED MESSAGE
     # =========================================================
@@ -1398,6 +1554,26 @@ async def snipe(ctx: commands.Context, index: int = 1):
 
     embed = discord.Embed(description=f"{data['content']}{data['extra_info']}", color=discord.Color.red())
     embed.set_author(name=f"Deleted by: {data['author']}", icon_url=data['avatar'])
+
+    media = data.get("attachments", [])
+    first_image_url = None
+    media_lines = []
+    for item in media:
+        try:
+            signed = supabase.storage.from_(MEDIA_BUCKET).create_signed_url(item["path"], 86400)
+            signed_url = signed.get("signedURL") or signed.get("signed_url") or ""
+            if signed_url:
+                media_lines.append(f"[{item.get('name', 'media')}]({signed_url})")
+                if first_image_url is None and str(item.get("content_type", "")).startswith("image/"):
+                    first_image_url = signed_url
+        except Exception:
+            pass
+
+    if media_lines:
+        embed.add_field(name="📎 Saved Media", value="\n".join(media_lines)[:1024], inline=False)
+    if first_image_url:
+        embed.set_image(url=first_image_url)
+
     embed.set_footer(text=f"Position: {index}/{total_logs} Last Deleted | Time: {data['timestamp']} (IST Zone Forced)")
     await ctx.send(embed=embed)
 
@@ -1421,8 +1597,8 @@ async def history(
     if count < 1:
         count = 1
 
-    if count > 100:
-        count = 100
+    if count > 250:
+        count = 250
 
     logs = []
 
@@ -1454,9 +1630,14 @@ async def history(
         if len(content) > 1000:
             content = content[:1000] + "..."
 
+        media_note = ""
+        media = msg.get("attachments", [])
+        if media:
+            media_note = "\n📎 **Media:** " + ", ".join(item.get("name", "file") for item in media)
+
         embed.add_field(
             name=f"{index}. {msg['timestamp']}",
-            value=f"```{content}```",
+            value=f"```{content}```{media_note}",
             inline=False
         )
 
@@ -1508,7 +1689,7 @@ async def bump_cmd(ctx: commands.Context):
 # ==============================================================================
 # 8. ROLE MANAGEMENT (STAFF ONLY)
 # ==============================================================================
-@bot.command(name="role", help='Give/remove a role. Usage: ?role @member +RoleName OR ?role @member @member +RoleName OR ?role @everyone +RoleName')
+@bot.command(name="role", help='Give/remove a role. Usage: ?role @member +RoleName OR ?role @member @member +RoleName OR ?role @source-role +RoleName OR ?role @everyone +RoleName')
 @has_mod_access()
 async def role_cmd(ctx: commands.Context, *targets_and_action: str):
     if len(targets_and_action) < 2:
@@ -1564,13 +1745,27 @@ async def role_cmd(ctx: commands.Context, *targets_and_action: str):
         return
 
     target_tokens = list(targets_and_action[:-1])
-    if any(token.lower() == "@everyone" for token in target_tokens):
+
+    # Targeting supports members, @everyone, and source-role mentions.
+    # Example: ?role @13-17 +Minors
+    source_role_ids = {role.id for role in ctx.message.role_mentions if role.id != target_role.id}
+    everyone_target = any(token.lower() == "@everyone" for token in target_tokens)
+
+    if everyone_target:
         targets = list(ctx.guild.members)
+    elif source_role_ids:
+        targets = [
+            member for member in ctx.guild.members
+            if any(role.id in source_role_ids for role in member.roles)
+        ]
+        if not targets:
+            await send_mod_response(ctx, "❌ No members currently have the mentioned source role(s).")
+            return
     else:
         mentioned_ids = {member.id for member in ctx.message.mentions}
         targets = [member for member in ctx.guild.members if member.id in mentioned_ids]
         if not targets:
-            await send_mod_response(ctx, "❌ No valid members found. Mention one or more members, or use `@everyone`.")
+            await send_mod_response(ctx, "❌ No valid members found. Mention one or more members, use `@everyone`, or mention a source role.")
             return
 
     unique_targets = []

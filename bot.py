@@ -2340,13 +2340,14 @@ def keep_alive():
 # ==============================================================================
 # 14. BOOT ENGINE INSTANTIATOR
 # ==============================================================================
+
 if __name__ == "__main__":
 
     files = [
+        "afk.json",
         "edit_logs.json",
         "snipe.json",
-        "warns.json",
-        TEMPROLE_FILE
+        "warns.json"
     ]
 
     for file in files:
@@ -2355,38 +2356,4 @@ if __name__ == "__main__":
                 f.write("{}")
 
     keep_alive()
-
-    async def start_bot_with_retry():
-        """Keep Render alive while Discord temporarily rate-limits or disconnects the login."""
-        delay = 60
-        while True:
-            try:
-                await bot.start(TOKEN, reconnect=True)
-                return
-            except discord.HTTPException as e:
-                try:
-                    await bot.close()
-                except Exception:
-                    pass
-                if getattr(e, "status", None) == 429:
-                    print(f"⚠️ Discord login rate-limited (429). Waiting {delay}s before a clean retry...")
-                else:
-                    print(f"⚠️ Discord HTTP error during login: {e}. Retrying in {delay}s...")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 900)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                try:
-                    await bot.close()
-                except Exception:
-                    pass
-                print(f"⚠️ Discord connection error: {e}. Retrying in {delay}s...")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 900)
-            except Exception:
-                try:
-                    await bot.close()
-                except Exception:
-                    pass
-                raise
-
-    asyncio.run(start_bot_with_retry())
+    bot.run(TOKEN)

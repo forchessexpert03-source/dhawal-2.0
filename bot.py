@@ -207,9 +207,17 @@ class FlexibleMemberConverter(commands.Converter):
         raise commands.MemberNotFound(argument)
 
 
+def parse_duration(duration: str):
+    match = re.fullmatch(r"(\\d+)\\s*([smhdw])", duration.strip().lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    return amount * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match.group(2)]
+
+
 MODERATION_COMMAND_NAMES = {
     "role", "warn", "warns", "clear-warns", "mute", "unmute",
-    "kick", "ban", "unban", "purge"
+    "kick", "ban", "unban", "purge", "temprole", "lock", "unlock", "slowmode"
 }
 
 
@@ -232,6 +240,7 @@ SNIPE_FILE = "edit_logs.json"
 SNIPE_HISTORY_FILE = "snipe.json"
 WARN_FILE = "warns.json"
 AFK_FILE = "afk.json"
+TEMPROLE_FILE = "temproles.json"
 
 
 def get_ist_time():
@@ -944,6 +953,8 @@ async def on_ready():
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Abhi9av 👑"))
     if not bump_reminder_loop.is_running():
         bump_reminder_loop.start()
+    if not temprole_expiry_loop.is_running():
+        temprole_expiry_loop.start()
     global snipe_supabase_loaded
     if not snipe_supabase_loaded:
         await asyncio.to_thread(load_snipe_from_supabase)
@@ -1432,7 +1443,44 @@ async def on_command_error(ctx, error):
             raise
 
 # ==============================================================================
-# 6. BUMP REMINDER BACKGROUND LOOP
+# 6. TEMPORARY ROLE EXPIRY BACKGROUND LOOP
+# ==============================================================================
+@tasks.loop(minutes=1)
+async def temprole_expiry_loop():
+    data = load_json_data(TEMPROLE_FILE)
+    if not data:
+        return
+    changed = False
+    now = time.time()
+    for key, entry in list(data.items()):
+        try:
+            guild = bot.get_guild(int(entry["guild_id"]))
+            if not guild:
+                continue
+            role = guild.get_role(int(entry["role_id"]))
+            member = guild.get_member(int(entry["member_id"]))
+            if float(entry["expires_at"]) <= now:
+                if role and member and role in member.roles:
+                    try:
+                        await member.remove_roles(role, reason="Temporary role expired")
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        print(f"Temporary role removal failed: {e}")
+                data.pop(key, None)
+                changed = True
+        except (KeyError, ValueError, TypeError):
+            data.pop(key, None)
+            changed = True
+    if changed:
+        save_json_data(data, TEMPROLE_FILE)
+
+
+@temprole_expiry_loop.before_loop
+async def before_temprole_loop():
+    await bot.wait_until_ready()
+
+
+# ==============================================================================
+# 7. BUMP REMINDER BACKGROUND LOOP
 # ==============================================================================
 @tasks.loop(minutes=1)
 async def bump_reminder_loop():
@@ -2083,6 +2131,90 @@ async def unban(ctx: commands.Context, user_id: int):
 
         await send_mod_response(ctx, f"❌ {e}")
 
+
+@bot.command(name="temprole", help="Usage: ?temprole @member 7d +RoleName")
+@has_mod_access()
+async def temprole(ctx: commands.Context, member: FlexibleMemberConverter, duration: str, *, role_name: str):
+    seconds = parse_duration(duration)
+    if seconds is None or seconds < 1:
+        await send_mod_response(ctx, "❌ Invalid duration. Use `30s`, `10m`, `2h`, `7d`, or `1w`.")
+        return
+    role_name = role_name.strip()
+    if role_name.startswith("+"):
+        role_name = role_name[1:].strip()
+    role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), ctx.guild.roles)
+    if not role:
+        await send_mod_response(ctx, f"❌ Role `{role_name}` not found.")
+        return
+    if role.is_default() or role.managed:
+        await send_mod_response(ctx, "❌ That role cannot be assigned manually.")
+        return
+    if role >= ctx.guild.me.top_role:
+        await send_mod_response(ctx, "❌ I can't manage that role because it is above my highest role.")
+        return
+    if role >= ctx.author.top_role and not ctx.author.guild_permissions.administrator:
+        await send_mod_response(ctx, "❌ You cannot assign a role equal to or higher than your highest role.")
+        return
+    try:
+        await member.add_roles(role, reason=f"Temporary role by {ctx.author}")
+    except discord.Forbidden:
+        await send_mod_response(ctx, "❌ I don't have permission to assign that role.")
+        return
+    except discord.HTTPException as e:
+        await send_mod_response(ctx, f"❌ Discord rejected the role assignment: `{e}`")
+        return
+    data = load_json_data(TEMPROLE_FILE)
+    data[f"{ctx.guild.id}:{member.id}:{role.id}"] = {
+        "guild_id": str(ctx.guild.id), "member_id": str(member.id),
+        "role_id": str(role.id), "expires_at": time.time() + seconds
+    }
+    save_json_data(data, TEMPROLE_FILE)
+    await send_mod_response(ctx, f"✅ Added **{role.name}** to {member.mention} for **{duration}**.")
+
+
+@bot.command(name="lock", help="Lock the current channel.")
+@has_mod_access()
+async def lock_channel(ctx: commands.Context):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = False
+    try:
+        await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Locked by {ctx.author}")
+        await send_mod_response(ctx, f"🔒 {ctx.channel.mention} is now locked.")
+    except discord.Forbidden:
+        await send_mod_response(ctx, "❌ I don't have permission to change this channel's permissions.")
+    except discord.HTTPException as e:
+        await send_mod_response(ctx, f"❌ Discord rejected the lock: `{e}`")
+
+
+@bot.command(name="unlock", help="Unlock the current channel.")
+@has_mod_access()
+async def unlock_channel(ctx: commands.Context):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = None
+    try:
+        await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Unlocked by {ctx.author}")
+        await send_mod_response(ctx, f"🔓 {ctx.channel.mention} is now unlocked.")
+    except discord.Forbidden:
+        await send_mod_response(ctx, "❌ I don't have permission to change this channel's permissions.")
+    except discord.HTTPException as e:
+        await send_mod_response(ctx, f"❌ Discord rejected the unlock: `{e}`")
+
+
+@bot.command(name="slowmode", aliases=["slow"], help="Usage: ?slowmode <seconds>")
+@has_mod_access()
+async def slowmode(ctx: commands.Context, seconds: int):
+    if seconds < 0 or seconds > 21600:
+        await send_mod_response(ctx, "❌ Slowmode must be between `0` and `21600` seconds.")
+        return
+    try:
+        await ctx.channel.edit(slowmode_delay=seconds, reason=f"Slowmode changed by {ctx.author}")
+        await send_mod_response(ctx, f"🐌 Slowmode {'disabled' if seconds == 0 else f'set to **{seconds} seconds**'} in {ctx.channel.mention}.")
+    except discord.Forbidden:
+        await send_mod_response(ctx, "❌ I don't have permission to change slowmode here.")
+    except discord.HTTPException as e:
+        await send_mod_response(ctx, f"❌ Discord rejected the slowmode change: `{e}`")
+
+
 @bot.command(name="purge", help="Bulk delete messages. Usage: ?purge <count> OR ?purge @member <count>")
 @has_full_access()
 async def purge(ctx: commands.Context, *args: str):
@@ -2213,7 +2345,8 @@ if __name__ == "__main__":
     files = [
         "edit_logs.json",
         "snipe.json",
-        "warns.json"
+        "warns.json",
+        TEMPROLE_FILE
     ]
 
     for file in files:
@@ -2224,22 +2357,36 @@ if __name__ == "__main__":
     keep_alive()
 
     async def start_bot_with_retry():
-        """Keep Render alive while Discord temporarily rate-limits the login endpoint."""
+        """Keep Render alive while Discord temporarily rate-limits or disconnects the login."""
         delay = 60
         while True:
             try:
                 await bot.start(TOKEN, reconnect=True)
-                break
+                return
             except discord.HTTPException as e:
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
                 if getattr(e, "status", None) == 429:
-                    print(f"⚠️ Discord login rate-limited (429). Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 900)
-                    continue
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f"⚠️ Discord connection error: {e}. Retrying in {delay} seconds...")
+                    print(f"⚠️ Discord login rate-limited (429). Waiting {delay}s before a clean retry...")
+                else:
+                    print(f"⚠️ Discord HTTP error during login: {e}. Retrying in {delay}s...")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 900)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
+                print(f"⚠️ Discord connection error: {e}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 900)
+            except Exception:
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
+                raise
 
     asyncio.run(start_bot_with_retry())

@@ -366,7 +366,8 @@ async def upload_deleted_media(message, guild_id):
     async def upload_bytes(name, data, content_type):
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name or "media")
         path = f"{guild_id}/{message.channel.id}/{message.id}/{safe_name}"
-        supabase.storage.from_(MEDIA_BUCKET).upload(
+        await asyncio.to_thread(
+            supabase.storage.from_(MEDIA_BUCKET).upload,
             path,
             data,
             {"content-type": content_type or "application/octet-stream", "upsert": "true"}
@@ -945,7 +946,7 @@ async def on_ready():
         bump_reminder_loop.start()
     global snipe_supabase_loaded
     if not snipe_supabase_loaded:
-        load_snipe_from_supabase()
+        await asyncio.to_thread(load_snipe_from_supabase)
         snipe_supabase_loaded = True
     print("Prefix commands ready. Using '?' as the command prefix.")
 
@@ -1142,7 +1143,7 @@ async def on_message(message):
     # REMOVE AFK WHEN THE AFK USER SENDS A MESSAGE
     # ---------------------------------------------------------
 
-    author_afk = get_afk_from_db(guild_id, author_id)
+    author_afk = await asyncio.to_thread(get_afk_from_db, guild_id, author_id)
 
     if author_afk:
         original_name = author_afk.get(
@@ -1150,7 +1151,7 @@ async def on_message(message):
             message.author.display_name
         )
 
-        remove_afk_from_db(guild_id, author_id)
+        await asyncio.to_thread(remove_afk_from_db, guild_id, author_id)
 
         try:
             await message.author.edit(nick=original_name)
@@ -1169,7 +1170,7 @@ async def on_message(message):
     if message.mentions:
         for mentioned_user in message.mentions:
             m_id = str(mentioned_user.id)
-            mentioned_afk = get_afk_from_db(guild_id, m_id)
+            mentioned_afk = await asyncio.to_thread(get_afk_from_db, guild_id, m_id)
 
             if mentioned_afk:
                 reason = mentioned_afk.get("reason", "AFK")
@@ -1300,7 +1301,7 @@ async def on_message_delete(message):
         snipe_data[channel_id] = snipe_data[channel_id][:MAX_SNIPE_DEPTH]
 
     save_json_data(snipe_data, SNIPE_HISTORY_FILE)
-    save_snipe_to_supabase(payload, guild_id, channel_id, msg_id)
+    await asyncio.to_thread(save_snipe_to_supabase, payload, guild_id, channel_id, msg_id)
 
 
 @bot.event
@@ -1319,7 +1320,7 @@ async def on_message_edit(before, after):
     if len(history_db) > 250:
         history_db.pop(list(history_db.keys())[0])
     save_json_data(history_db, SNIPE_FILE)
-    save_edit_to_supabase(str(before.id), history_db[str(before.id)])
+    await asyncio.to_thread(save_edit_to_supabase, str(before.id), history_db[str(before.id)])
         # =========================================================
     # MESSAGE LOGS - EDITED MESSAGE
     # =========================================================
@@ -1417,8 +1418,18 @@ async def on_command_error(ctx, error):
         await send_mod_response(ctx, f"❌ Bad argument: `{error}`")
         return
 
+    if isinstance(error, discord.HTTPException) and getattr(error, "status", None) == 429:
+        print("⚠️ Discord API rate-limited a command response (429). Skipping extra response.")
+        return
+
     print(f"Unhandled command error: {error}")
-    await send_mod_response(ctx, f"❌ Execution error: `{error}`")
+    try:
+        await send_mod_response(ctx, f"❌ Execution error: `{error}`")
+    except discord.HTTPException as send_error:
+        if getattr(send_error, "status", None) == 429:
+            print("⚠️ Discord API rate-limited the error response too.")
+        else:
+            raise
 
 # ==============================================================================
 # 6. BUMP REMINDER BACKGROUND LOOP
@@ -1461,7 +1472,7 @@ async def afk(ctx: commands.Context, *, reason: str = "Working / Afk"):
     guild_id = str(ctx.guild.id)
 
     # Block re-applying AFK if user is already AFK
-    existing_afk = get_afk_from_db(guild_id, user_id)
+    existing_afk = await asyncio.to_thread(get_afk_from_db, guild_id, user_id)
 
     if existing_afk:
         existing_reason = existing_afk.get("reason", "AFK")
@@ -1474,7 +1485,7 @@ async def afk(ctx: commands.Context, *, reason: str = "Working / Afk"):
     current_display_name = ctx.author.display_name
     afk_time = time.time()
 
-    set_afk_in_db(
+    await asyncio.to_thread(set_afk_in_db,
         guild_id=guild_id,
         user_id=user_id,
         reason=reason,
@@ -1502,7 +1513,7 @@ async def afk_clear(ctx: commands.Context, member: discord.Member):
     guild_id = str(ctx.guild.id)
     user_id = str(member.id)
 
-    afk_data = get_afk_from_db(guild_id, user_id)
+    afk_data = await asyncio.to_thread(get_afk_from_db, guild_id, user_id)
 
     if not afk_data:
         await ctx.send(f"✅ {member.mention} is not AFK.")
@@ -1513,7 +1524,7 @@ async def afk_clear(ctx: commands.Context, member: discord.Member):
         member.display_name
     )
 
-    remove_afk_from_db(guild_id, user_id)
+    await asyncio.to_thread(remove_afk_from_db, guild_id, user_id)
 
     try:
         await member.edit(nick=original_name)
@@ -2211,4 +2222,24 @@ if __name__ == "__main__":
                 f.write("{}")
 
     keep_alive()
-    bot.run(TOKEN)
+
+    async def start_bot_with_retry():
+        """Keep Render alive while Discord temporarily rate-limits the login endpoint."""
+        delay = 60
+        while True:
+            try:
+                await bot.start(TOKEN, reconnect=True)
+                break
+            except discord.HTTPException as e:
+                if getattr(e, "status", None) == 429:
+                    print(f"⚠️ Discord login rate-limited (429). Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 900)
+                    continue
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"⚠️ Discord connection error: {e}. Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 900)
+
+    asyncio.run(start_bot_with_retry())

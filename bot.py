@@ -1735,7 +1735,7 @@ async def bump_cmd(ctx: commands.Context):
 @has_mod_access()
 async def role_cmd(ctx: commands.Context, *targets_and_action: str):
     if len(targets_and_action) < 2:
-        await send_mod_response(ctx, "❌ Format Error: Use `?role @member +RoleName`, `?role @member @member +RoleName`, or `?role @everyone +RoleName`.")
+        await send_mod_response(ctx, "❌ Format Error: Use `?role @member +RoleName`, `?role @member @member +RoleName`, `?role @source-role +RoleName`, or `?role @everyone +RoleName`.")
         return
 
     # Read the role action from the raw command so role names containing spaces work.
@@ -1789,8 +1789,31 @@ async def role_cmd(ctx: commands.Context, *targets_and_action: str):
     target_tokens = list(targets_and_action[:-1])
 
     # Targeting supports members, @everyone, and source-role mentions.
-    # Example: ?role @13-17 +Minors
-    source_role_ids = {role.id for role in ctx.message.role_mentions if role.id != target_role.id}
+    # Examples:
+    # ?role @13-17 +Minors
+    # ?role @Members +Event Ping
+    # ?role @Role1 @Role2 +SomeRole
+    # Resolve source roles from Discord role mentions first, then also from
+    # raw role-mention IDs so the feature still works if parsing is unusual.
+    source_roles = [role for role in ctx.message.role_mentions if role.id != target_role.id]
+    raw_role_ids = re.findall(r"<@&(\d+)>", ctx.message.content)
+    for role_id in raw_role_ids:
+        role = ctx.guild.get_role(int(role_id))
+        if role and role.id != target_role.id and role not in source_roles:
+            source_roles.append(role)
+
+    # Also allow a role name without relying on Discord mention parsing.
+    # This is useful when Discord sends the role token in an unexpected form.
+    if not source_roles:
+        before_action = command_text[:action_match.start()].strip()
+        candidate_names = before_action.split()
+        for role in ctx.guild.roles:
+            if role.id == target_role.id:
+                continue
+            if role.name.lower() in before_action.lower() and role.name.lower() != "@everyone":
+                source_roles.append(role)
+
+    source_role_ids = {role.id for role in source_roles}
     everyone_target = any(token.lower() == "@everyone" for token in target_tokens)
 
     if everyone_target:

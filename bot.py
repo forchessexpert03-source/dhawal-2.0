@@ -69,6 +69,9 @@ BOOSTER_ROLE_NAME = "Server Booster"
 BUMPERS_ROLE_NAME = "Bumpers"
 BUMP_FILE = "bump_data.json"
 
+# Owner-only protected timed AFK system
+FIXED_AFK_OWNER_ID = 1453330376842805473
+
 DISBOARD_BOT_ID = 302050872383242240
 BUMP_COOLDOWN_SECONDS = 2 * 60 * 60  # 2 hours
 
@@ -208,7 +211,7 @@ class FlexibleMemberConverter(commands.Converter):
 
 
 def parse_duration(duration: str):
-    match = re.fullmatch(r"(\\d+)\\s*([smhdw])", duration.strip().lower())
+    match = re.fullmatch(r"(\d+)\s*([smhdw])", duration.strip().lower())
     if not match:
         return None
     amount = int(match.group(1))
@@ -285,6 +288,20 @@ def set_afk_in_db(guild_id, user_id, reason, afk_time, original_name):
         "reason": reason,
         "afk_time": float(afk_time),
         "original_name": original_name
+    }).execute()
+
+
+def set_fixed_afk_in_db(guild_id, user_id, reason, afk_time, expires_at, original_name, set_by):
+    """Store an owner-created protected timed AFK."""
+    supabase.table("afk_data").upsert({
+        "guild_id": str(guild_id),
+        "user_id": str(user_id),
+        "reason": reason,
+        "afk_time": float(afk_time),
+        "expires_at": float(expires_at),
+        "original_name": original_name,
+        "set_by": str(set_by),
+        "protected": True
     }).execute()
 
 
@@ -955,6 +972,8 @@ async def on_ready():
         bump_reminder_loop.start()
     if not temprole_expiry_loop.is_running():
         temprole_expiry_loop.start()
+    if not fixed_afk_expiry_loop.is_running():
+        fixed_afk_expiry_loop.start()
     global snipe_supabase_loaded
     if not snipe_supabase_loaded:
         await asyncio.to_thread(load_snipe_from_supabase)
@@ -1157,22 +1176,26 @@ async def on_message(message):
     author_afk = await asyncio.to_thread(get_afk_from_db, guild_id, author_id)
 
     if author_afk:
-        original_name = author_afk.get(
-            "original_name",
-            message.author.display_name
-        )
-
-        await asyncio.to_thread(remove_afk_from_db, guild_id, author_id)
-
-        try:
-            await message.author.edit(nick=original_name)
-        except discord.Forbidden:
+        # Owner-created fixed AFKs are protected and remain active until expiry.
+        if author_afk.get("protected"):
             pass
+        else:
+            original_name = author_afk.get(
+                "original_name",
+                message.author.display_name
+            )
 
-        await message.channel.send(
-            f"wb {message.author.mention}, maine aapka AFK status hata diya hai! 👋",
-            delete_after=5
-        )
+            await asyncio.to_thread(remove_afk_from_db, guild_id, author_id)
+
+            try:
+                await message.author.edit(nick=original_name)
+            except discord.Forbidden:
+                pass
+
+            await message.channel.send(
+                f"wb {message.author.mention}, maine aapka AFK status hata diya hai! 👋",
+                delete_after=5
+            )
 
     # ---------------------------------------------------------
     # CHECK IF SOMEONE MENTIONED AN AFK USER
@@ -1443,7 +1466,44 @@ async def on_command_error(ctx, error):
             raise
 
 # ==============================================================================
-# 6. TEMPORARY ROLE EXPIRY BACKGROUND LOOP
+# 6. PROTECTED FIXED-AFK EXPIRY BACKGROUND LOOP
+# ==============================================================================
+@tasks.loop(minutes=1)
+async def fixed_afk_expiry_loop():
+    """Automatically remove owner-created protected AFKs after their expiry timestamp."""
+    try:
+        response = (
+            supabase.table("afk_data")
+            .select("guild_id,user_id,expires_at,original_name,protected")
+            .eq("protected", True)
+            .execute()
+        )
+        now = time.time()
+        for entry in (response.data or []):
+            try:
+                expires_at = float(entry.get("expires_at"))
+                if expires_at > now:
+                    continue
+                guild = bot.get_guild(int(entry["guild_id"]))
+                member = guild.get_member(int(entry["user_id"])) if guild else None
+                if member:
+                    try:
+                        await member.edit(nick=entry.get("original_name") or member.display_name)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                await asyncio.to_thread(remove_afk_from_db, entry["guild_id"], entry["user_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    except Exception as e:
+        print(f"⚠️ Fixed AFK expiry check failed: {e}")
+
+
+@fixed_afk_expiry_loop.before_loop
+async def before_fixed_afk_loop():
+    await bot.wait_until_ready()
+
+
+# 7. TEMPORARY ROLE EXPIRY BACKGROUND LOOP
 # ==============================================================================
 @tasks.loop(minutes=1)
 async def temprole_expiry_loop():
@@ -1551,6 +1611,93 @@ async def afk(ctx: commands.Context, *, reason: str = "Working / Afk"):
         f"💤 {ctx.author.mention}, aap ab AFK hain: **{reason}**"
     )
 @bot.command(
+    name="fixedafk",
+    help="Owner-only protected timed AFK. Usage: ?fixedafk [@member] \"reason\" 250h"
+)
+async def fixed_afk(ctx: commands.Context, *args: str):
+    """Set a protected timed AFK. Only the configured owner can use this command."""
+    if ctx.author.id != FIXED_AFK_OWNER_ID:
+        await ctx.send("❌ This command is restricted to the bot owner.", delete_after=10)
+        return
+
+    raw = ctx.message.content.strip()
+    prefix = ctx.prefix or "?"
+    command_name = ctx.invoked_with or "fixedafk"
+    if raw.lower().startswith(prefix + command_name.lower()):
+        raw = raw[len(prefix + command_name):].strip()
+
+    # Duration must be the final token, e.g. 250h / 30m / 2d.
+    duration_match = re.search(r"(\d+)\s*([smhdw])\s*$", raw, re.IGNORECASE)
+    if not duration_match:
+        await ctx.send(
+            "❌ Usage: `?fixedafk \"reason\" 250h` or `?fixedafk @member \"reason\" 250h`",
+            delete_after=10
+        )
+        return
+
+    duration_token = duration_match.group(0).strip()
+    duration_seconds = parse_duration(duration_token)
+    if duration_seconds is None or duration_seconds <= 0:
+        await ctx.send("❌ Invalid duration. Example: `250h`, `30m`, `2d`.", delete_after=10)
+        return
+
+    body = raw[:duration_match.start()].strip()
+    target = ctx.author
+
+    if ctx.message.mentions:
+        # Only the first member mention is the target.
+        target = ctx.message.mentions[0]
+        body = re.sub(r"<@!?\d+>", "", body, count=1).strip()
+
+    # Require a quoted reason so the target/reason parsing is unambiguous.
+    reason_match = re.fullmatch(r'\s*[\"](.+?)[\"]\s*', body, re.DOTALL)
+    if not reason_match:
+        await ctx.send(
+            "❌ Put the AFK reason inside quotes. Example: `?fixedafk \"Goodbye\" 250h`",
+            delete_after=10
+        )
+        return
+
+    reason = reason_match.group(1).strip()
+    if not reason:
+        await ctx.send("❌ AFK reason cannot be empty.", delete_after=10)
+        return
+
+    guild_id = str(ctx.guild.id)
+    user_id = str(target.id)
+    existing = await asyncio.to_thread(get_afk_from_db, guild_id, user_id)
+    if existing:
+        await ctx.send(
+            f"❌ {target.mention} already has an AFK status. Clear it first before setting a fixed AFK.",
+            delete_after=10
+        )
+        return
+
+    now = time.time()
+    expires_at = now + duration_seconds
+    original_name = target.display_name
+
+    await asyncio.to_thread(
+        set_fixed_afk_in_db,
+        guild_id, user_id, reason, now, expires_at, original_name, ctx.author.id
+    )
+
+    try:
+        new_nick = f"[AFK] {original_name}"[:32]
+        await target.edit(nick=new_nick)
+    except discord.Forbidden:
+        pass
+
+    hours = duration_seconds / 3600
+    duration_display = f"{int(hours)}h" if duration_seconds % 3600 == 0 else duration_token
+    await ctx.send(
+        f"🔒 {target.mention} is now on **protected AFK**: **{reason}**\n"
+        f"⏳ Duration: `{duration_display}`. It cannot be cleared by staff/admins; it expires automatically.",
+        delete_after=10
+    )
+
+
+@bot.command(
     name="afkclear",
     aliases=["afk-clear"],
     help="Clear someone's AFK status.\nUsage: ?afkclear @member"
@@ -1565,6 +1712,11 @@ async def afk_clear(ctx: commands.Context, member: discord.Member):
 
     if not afk_data:
         await ctx.send(f"✅ {member.mention} is not AFK.")
+        return
+
+    # Protected fixed AFK can only be cleared by the fixed-AFK owner.
+    if afk_data.get("protected") and ctx.author.id != FIXED_AFK_OWNER_ID:
+        await ctx.send("🔒 This is a protected fixed AFK and can only be cleared by its owner.", delete_after=10)
         return
 
     original_name = afk_data.get(

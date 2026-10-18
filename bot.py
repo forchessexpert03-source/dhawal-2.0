@@ -35,6 +35,13 @@ intents.presences = True
 # Prefix changed from "!" to "?" — all commands are now used like ?warn, ?mute, ?bump etc.
 bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
 
+# Basic latency check command
+@bot.command(name="ping", help="Check the bot's latency.")
+async def ping(ctx: commands.Context):
+    latency = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong! Latency: `{latency}ms`")
+
+
 # Dictionary maps display labels to target role search strings
 COLOR_ROLES_1 = {
     "Crimson": "Crimson", "Hot pink": "Hot pink", "Magenta": "Magenta",

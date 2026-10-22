@@ -957,8 +957,18 @@ async def self_roles(ctx: commands.Context):
 @bot.event
 async def on_ready():
     print(f'🤖 {bot.user.name} Master Routing Cluster Bootstrapped successfully!')
-    await bot.tree.sync()
-    print("✅ Slash commands synced.")
+
+    # Avoid syncing every startup/reconnect. Existing registered slash commands
+    # remain available. Set SYNC_COMMANDS_ON_START=true for one deliberate sync
+    # after adding/changing application commands, then unset it again.
+    if os.getenv("SYNC_COMMANDS_ON_START", "false").strip().lower() in {"1", "true", "yes"}:
+        try:
+            synced = await bot.tree.sync()
+            print(f"✅ Slash commands synced: {len(synced)}")
+        except discord.HTTPException as exc:
+            print(f"⚠️ Slash-command sync failed (HTTP {exc.status}); continuing without retry.")
+    else:
+        print("ℹ️ Slash-command sync skipped (existing registered commands are preserved).")
     bot.add_view(ColorView())
     bot.add_view(SelfRoleView())
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Abhi9av 👑"))
@@ -1215,6 +1225,33 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+# Message-log circuit breaker: do not repeatedly call Discord while a 429
+# or Cloudflare 1015 response is active. No rapid retry loop is used.
+_message_log_backoff_until = 0.0
+_message_log_backoff_seconds = 60
+
+async def safe_send_message_log(channel, *, embed):
+    global _message_log_backoff_until, _message_log_backoff_seconds
+
+    now = time.monotonic()
+    if now < _message_log_backoff_until:
+        return False
+
+    try:
+        await channel.send(embed=embed)
+        _message_log_backoff_seconds = 60
+        return True
+    except discord.HTTPException as exc:
+        if exc.status == 429:
+            _message_log_backoff_until = time.monotonic() + _message_log_backoff_seconds
+            print(f"⚠️ Message log skipped after HTTP 429; pausing log sends for {_message_log_backoff_seconds}s.")
+            _message_log_backoff_seconds = min(_message_log_backoff_seconds * 2, 900)
+        else:
+            # Permission/not-found failures should not crash the event handler.
+            print(f"⚠️ Message log send failed (HTTP {exc.status}); not retrying this event.")
+        return False
+
+
 @bot.event
 async def on_message_delete(message):
     if message.author.bot or not message.guild:
@@ -1293,7 +1330,7 @@ async def on_message_delete(message):
 
         log_embed.set_thumbnail(url=message.author.display_avatar.url)
         log_embed.set_footer(text=get_ist_time().strftime("%d-%m-%Y %I:%M:%S %p"))
-        await message_logs_channel.send(embed=log_embed)
+        await safe_send_message_log(message_logs_channel, embed=log_embed)
 
     edit_note = ""
     if was_edited:
@@ -1391,9 +1428,7 @@ async def on_message_edit(before, after):
             text=get_ist_time().strftime("%d-%m-%Y %I:%M:%S %p")
         )
 
-        await message_logs_channel.send(
-            embed=log_embed
-        )
+        await safe_send_message_log(message_logs_channel, embed=log_embed)
 
 @bot.event
 async def on_command_error(ctx, error):

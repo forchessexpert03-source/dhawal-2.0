@@ -2399,16 +2399,176 @@ async def help_command(ctx):
     )
     await ctx.send(embed=embed)
 
-@bot.command(name="serverinfo", help="Show server statistics.")
+@bot.command(
+    name="serverinfo",
+    aliases=["server-info", "serverstats"],
+    help="Show detailed server information. Staff-only command."
+)
 async def serverinfo(ctx: commands.Context):
+    # Only members with a Staff or Support Staff role can use this command.
+    # This deliberately does not grant access based only on administrator permission.
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used inside a server.")
+        return
+
+    staff_role_names = {"Staff", SUPPORT_ROLE_NAME}
+    author_role_names = {role.name for role in ctx.author.roles}
+    if not (staff_role_names & author_role_names):
+        await ctx.send(
+            "❌ You need the **Staff** or **Support Staff** role to use this command.",
+            delete_after=10
+        )
+        return
+
     g = ctx.guild
-    embed = discord.Embed(title=f"Architecture Report: {g.name}", color=discord.Color.blue())
-    embed.add_field(name="Structural ID", value=f"`{g.id}`", inline=True)
-    embed.add_field(name="Primary Owner Node", value=g.owner.mention if g.owner else "Null Reference", inline=True)
-    embed.add_field(name="Population Registry", value=f"Total: `{g.member_count}`", inline=True)
-    embed.add_field(name="Channel Subsections", value=f"Text: `{len(g.text_channels)}` | Voice: `{len(g.voice_channels)}`", inline=False)
-    if g.icon: embed.set_thumbnail(url=g.icon.url)
-    await ctx.send(embed=embed)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    created_at = g.created_at
+    server_age_days = max(0, (now - created_at).days)
+
+    # Counts are based on the members currently cached by discord.py.
+    cached_members = list(g.members)
+    humans = sum(1 for member in cached_members if not member.bot)
+    bots = sum(1 for member in cached_members if member.bot)
+    online = sum(
+        1 for member in cached_members
+        if not member.bot and member.status != discord.Status.offline
+    )
+    offline = max(0, humans - online)
+
+    text_channels = len(g.text_channels)
+    voice_channels = len(g.voice_channels)
+    categories = len(g.categories)
+    stage_channels = sum(1 for channel in g.channels if isinstance(channel, discord.StageChannel))
+    forum_channels = sum(1 for channel in g.channels if isinstance(channel, discord.ForumChannel))
+    category_channels = sum(1 for channel in g.channels if isinstance(channel, discord.CategoryChannel))
+
+    custom_roles = [role for role in g.roles if role.name != "@everyone"]
+    custom_emojis = len(g.emojis)
+    animated_emojis = sum(1 for emoji in g.emojis if emoji.animated)
+    static_emojis = custom_emojis - animated_emojis
+    stickers_count = len(g.stickers)
+
+    def display_setting(value):
+        return str(value).replace("_", " ").title() if value is not None else "Not set"
+
+    owner_text = f"{g.owner} ({g.owner.mention})" if g.owner else "Unavailable"
+    icon_url = g.icon.url if g.icon else None
+    banner_url = g.banner.url if g.banner else None
+    description = (g.description or "No server description set.")[:1000]
+    system_channel = g.system_channel.mention if g.system_channel else "Not set"
+    rules_channel = g.rules_channel.mention if g.rules_channel else "Not set"
+    afk_channel = g.afk_channel.mention if g.afk_channel else "Not set"
+    afk_timeout_minutes = int(g.afk_timeout / 60)
+
+    overview = discord.Embed(
+        title=f"📊 Server Information — {g.name}",
+        description=description,
+        color=discord.Color.blurple(),
+        timestamp=now
+    )
+    if icon_url:
+        overview.set_thumbnail(url=icon_url)
+    if banner_url:
+        overview.set_image(url=banner_url)
+
+    overview.add_field(name="🆔 Server ID", value=f"`{g.id}`", inline=True)
+    overview.add_field(name="👑 Server Owner", value=owner_text[:1024], inline=True)
+    overview.add_field(
+        name="📅 Created On",
+        value=f"{discord.utils.format_dt(created_at, style='F')}\n({server_age_days:,} days ago)",
+        inline=False
+    )
+    overview.add_field(
+        name="👥 Members",
+        value=(
+            f"**Total:** `{g.member_count if g.member_count is not None else len(cached_members):,}`\n"
+            f"**Humans cached:** `{humans:,}`\n"
+            f"**Bots cached:** `{bots:,}`\n"
+            f"**Online humans:** `{online:,}`\n"
+            f"**Offline / unavailable humans:** `{offline:,}`"
+        ),
+        inline=True
+    )
+    overview.add_field(
+        name="💬 Channels",
+        value=(
+            f"**Text:** `{text_channels}`\n"
+            f"**Voice:** `{voice_channels}`\n"
+            f"**Categories:** `{category_channels}`\n"
+            f"**Stage:** `{stage_channels}`\n"
+            f"**Forum:** `{forum_channels}`"
+        ),
+        inline=True
+    )
+    overview.add_field(
+        name="🎭 Community Assets",
+        value=(
+            f"**Roles (excluding @everyone):** `{len(custom_roles)}`\n"
+            f"**Emojis:** `{custom_emojis}` ({static_emojis} static, {animated_emojis} animated)\n"
+            f"**Stickers:** `{stickers_count}`"
+        ),
+        inline=True
+    )
+    overview.add_field(
+        name="🚀 Boost Status",
+        value=(
+            f"**Boost level:** `{g.premium_tier}`\n"
+            f"**Boost count:** `{g.premium_subscription_count or 0}`"
+        ),
+        inline=True
+    )
+    overview.add_field(
+        name="🔐 Server Settings",
+        value=(
+            f"**Verification:** `{display_setting(g.verification_level)}`\n"
+            f"**Explicit content filter:** `{display_setting(g.explicit_content_filter)}`\n"
+            f"**Default notifications:** `{display_setting(g.default_notifications)}`\n"
+            f"**Preferred locale:** `{g.preferred_locale}`"
+        ),
+        inline=False
+    )
+    overview.add_field(
+        name="📌 Important Channels",
+        value=(
+            f"**Rules:** {rules_channel}\n"
+            f"**System / welcome:** {system_channel}\n"
+            f"**AFK:** {afk_channel} ({afk_timeout_minutes} min timeout)"
+        ),
+        inline=False
+    )
+    overview.set_footer(text=f"Requested by {ctx.author.display_name} • Staff-only command")
+
+    details = discord.Embed(
+        title=f"🧾 More Details — {g.name}",
+        color=discord.Color.dark_teal()
+    )
+    features = [feature.replace("_", " ").title() for feature in g.features]
+    details.add_field(
+        name="✨ Enabled Server Features",
+        value="\n".join(f"• {feature}" for feature in features)[:1024] if features else "No special features reported.",
+        inline=False
+    )
+
+    role_names = [role.name for role in reversed(custom_roles)]
+    role_text = ", ".join(f"`{name}`" for name in role_names) if role_names else "No custom roles."
+    details.add_field(
+        name=f"🎭 Role List ({len(custom_roles)})",
+        value=role_text[:1024],
+        inline=False
+    )
+
+    details.add_field(
+        name="🔗 Extra Information",
+        value=(
+            f"**Vanity invite:** `{('discord.gg/' + g.vanity_url_code) if g.vanity_url_code else 'Not available'}`\n"
+            f"**Maximum members (reported):** `{g.max_members if g.max_members is not None else 'Not reported'}`\n"
+            f"**Server boost role:** {g.premium_subscriber_role.mention if g.premium_subscriber_role else 'Not available'}"
+        ),
+        inline=False
+    )
+    details.set_footer(text=f"Server ID: {g.id} • Some member counts depend on Discord's member cache")
+
+    await ctx.send(embeds=[overview, details])
 
 # ==============================================================================
 # 13. RUNTIME KEEP-ALIVE SYSTEM ENGINE
